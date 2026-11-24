@@ -12,7 +12,7 @@ You need a public URL first, because GitHub sends webhooks to it.
 3. Click **Create GitHub App** and confirm on GitHub.
 4. GitHub redirects to `<URL>/setup/github-app`, which shows a one time code and the command to run.
 
-Permissions requested: Contents (write), Pull requests (write), Commit statuses (write), Workflows (write), Metadata (read). Workflows is needed because the setup pull request adds `.github/workflows/voxium.yml`. Events: Pull request. GitHub always sends installation events for apps with webhooks on, so those need no extra subscription.
+Permissions requested: Contents (write), Pull requests (write), Commit statuses (write), Workflows (write), Metadata (read). Workflows is needed because the setup pull request adds `.github/workflows/voxium.yml`. Events: Pull request and Pull request review (reviews carry Team Leader approvals). GitHub always sends installation events for apps with webhooks on, so those need no extra subscription.
 
 ## 2. Get the credentials
 
@@ -38,7 +38,11 @@ This writes `github-app/out/private-key.pem` and `github-app/out/secrets.env` (b
 3. Back on the dashboard, click **Set up Voxium** on the repo. A pull request appears with the architecture file, baseline, agent rules, CI workflow and MCP config.
 4. Review `voxium/architecture.json` and merge.
 5. Open a pull request that breaks a layer rule. A `voxium/rules` status appears on it within a few seconds and fails with the rule names. Open the repo page on the dashboard to see the check result.
-6. In the PR, edit `voxium/architecture.json` to weaken a rule. The check still applies the base branch rules and says the architecture files changed.
+6. In the PR, edit `voxium/architecture.json` to weaken a rule. The check fails and asks for Team Leader approval, whatever the code looks like. Approve the PR from another account that is an Owner or Team Leader and has write access, and it is checked again by the new rules.
+
+## 5. Make it required
+
+In branch protection or a ruleset for the default branch, require the status `voxium/rules` and choose the Voxium app as its source. Also require branches to be up to date and review from code owners.
 
 ## If something does not work
 

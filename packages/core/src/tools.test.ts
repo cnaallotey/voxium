@@ -56,6 +56,14 @@ describe("agent tools", () => {
     expect(checkImport(ctx, "src/ui/a.ts", "@scope/lib").allowed).toBe(true);
   });
 
+  it("check_import sees through a target outside every module", () => {
+    const c: ToolContext = { ...ctx, files: { ...files, "src/bridge.ts": `export * from "./ui/a";` } };
+    const res = checkImport(c, "src/data/d.ts", "src/bridge.ts");
+    expect(res.allowed).toBe(false);
+    expect(res.problems[0].message).toMatch(/outside every module/);
+    expect(checkImport(c, "src/ui/a.ts", "src/bridge.ts").allowed).toBe(true);
+  });
+
   it("check_change reports only introduced violations", () => {
     const ok = checkChange(ctx, [{ path: "src/ui/b.ts", content: `import "../services/s";` }]);
     expect(ok.ok).toBe(true);

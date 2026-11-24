@@ -1,4 +1,5 @@
-import { assignModules, checkArchitecture } from "./check.js";
+import { assignModules, checkArchitecture, moduleDependencies, withoutIgnored } from "./check.js";
+import { IGNORE_DIRS } from "./graph.js";
 import type { Architecture, InferResult, ProjectGraph } from "./types.js";
 
 const GROUP_DIRS = new Set(["features", "modules", "domains", "packages", "apps", "services"]);
@@ -6,6 +7,7 @@ const GROUP_DIRS = new Set(["features", "modules", "domains", "packages", "apps"
 const NOT_MODULES = new Set([
   "test", "tests", "__tests__", "test_dts", "e2e", "spec", "specs", "playground", "playgrounds",
   "docs", "doc", "scripts", "examples", "example", "fixtures", "benchmark", "benchmarks", "bench", "tools", "stories",
+  "build", "dist", "out", "coverage",
 ]);
 const PIN_TOP =new Set(["app", "pages", "routes", "views", "screens", "cli", "bin", "main", "ui"]);
 const PIN_BOTTOM = new Set(["shared", "utils", "util", "lib", "libs", "common", "types", "constants", "config"]);
@@ -57,8 +59,31 @@ export function orderLayers(names: string[], edgeWeights: Map<string, number>): 
   return out;
 }
 
-export function inferArchitecture(graph: ProjectGraph): InferResult {
+/**
+ * Committed build output, as ignore globs. A folder qualifies when it has a typical build or cache name,
+ * is not inside a src folder, and holds only plain JavaScript (or is a dot folder).
+ */
+export function detectBuildOutput(paths: string[]): string[] {
+  const onlyJs = new Map<string, boolean>();
+  for (const p of paths) {
+    const dirs = p.split("/").slice(0, -1);
+    const i = dirs.findIndex((d) => IGNORE_DIRS.has(d));
+    if (i === -1 || dirs.slice(0, i).includes("src")) continue;
+    const dir = dirs.slice(0, i + 1).join("/");
+    const js = dirs[i].startsWith(".") || /\.(?:js|mjs|cjs)$/.test(p);
+    onlyJs.set(dir, (onlyJs.get(dir) ?? true) && js);
+  }
+  return [...onlyJs].filter(([, js]) => js).map(([dir]) => `${dir}/**`).sort();
+}
+
+/** Pass every source path in the repo as "paths" when some files were too large to be part of the graph. */
+export function inferArchitecture(input: ProjectGraph, opts: { paths?: string[] } = {}): InferResult {
   const notes: string[] = [];
+  const ignore = detectBuildOutput(opts.paths ?? input.files);
+  const graph = withoutIgnored(input, ignore);
+  if (ignore.length) {
+    notes.push(`Treated as build output and not checked: ${ignore.join(", ")}. Remove from "ignore" if any of it is source code.`);
+  }
   const srcRoot = pickSourceRoot(graph.files);
   const prefix = srcRoot ? `${srcRoot}/` : "";
 
@@ -115,17 +140,16 @@ export function inferArchitecture(graph: ProjectGraph): InferResult {
     layers: Object.keys(modules),
     rules: [],
     exceptions: [],
+    ...(ignore.length ? { ignore } : {}),
   };
 
   // Module edges from the import graph.
   const modOf = assignModules(draft, graph.files);
   const weights = new Map<string, number>();
-  for (const e of graph.edges) {
-    if (!e.to) continue;
-    const a = modOf.get(e.from);
-    const b = modOf.get(e.to);
-    if (!a || !b || a === b) continue;
-    weights.set(`${a}>${b}`, (weights.get(`${a}>${b}`) ?? 0) + 1);
+  for (const d of moduleDependencies(graph, modOf)) {
+    if (!d.toMod) continue;
+    const k = `${d.fromMod}>${d.toMod}`;
+    weights.set(k, (weights.get(k) ?? 0) + 1);
   }
 
   const layers = orderLayers(Object.keys(modules), weights);
@@ -183,7 +207,7 @@ export function inferArchitecture(graph: ProjectGraph): InferResult {
   }
   const unassigned = graph.files.length - modOf.size;
   if (unassigned > 0) {
-    notes.push(`${unassigned} file(s) sit outside any module (for example root level files) and are not checked.`);
+    notes.push(`${unassigned} file(s) sit outside any module (for example root level files) and are not checked themselves. Importing one counts as importing everything it leads to.`);
   }
 
   return { architecture: draft, confidence, notes, existingViolations: existing.length };

@@ -3,15 +3,16 @@
  * Import from "@voxium/core/node". The main entry point stays free of node:* imports
  * so it can run in Cloudflare Workers.
  */
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { buildGraphFromFiles, IGNORE_DIRS, isSourcePath, type BuildGraphOptions, type FileMap } from "./graph.js";
+import { ARCH_FILE_PATH, BASELINE_FILE_PATH, PROTECTED_FILES, parseBaseline, type ProtectedContents } from "./protect.js";
 import { validateArchitecture } from "./schema.js";
 import type { Architecture, ProjectGraph } from "./types.js";
 
-export const DIR = "voxium";
-export const ARCH_FILE = `${DIR}/architecture.json`;
-export const BASELINE_FILE = `${DIR}/baseline.json`;
+export const ARCH_FILE = ARCH_FILE_PATH;
+export const BASELINE_FILE = BASELINE_FILE_PATH;
 
 function walk(root: string, dir: string, acc: FileMap): void {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -26,10 +27,60 @@ function walk(root: string, dir: string, acc: FileMap): void {
   }
 }
 
+function git(root: string, args: string[]): string {
+  return execFileSync("git", args, { cwd: root, encoding: "utf8", maxBuffer: 1 << 28, stdio: ["ignore", "pipe", "ignore"] });
+}
+
+/** Every tracked or not ignored path, or null when root is not inside a git work tree. */
+function gitPaths(root: string): string[] | null {
+  try {
+    const out = git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
+    const paths = [...new Set(out.split("\0").filter(Boolean))];
+    return paths.length ? paths : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Source files by path. In a git repo, git decides what counts: everything that is or could be committed,
+ * which is what CI and the platform see. Elsewhere, fall back to skipping well known output folders.
+ */
 export function readProjectFiles(root: string): FileMap {
+  const abs = path.resolve(root);
   const acc: FileMap = {};
-  walk(path.resolve(root), path.resolve(root), acc);
+  const tracked = gitPaths(abs);
+  if (!tracked) {
+    walk(abs, abs, acc);
+    return acc;
+  }
+  for (const rel of tracked) {
+    if (!isSourcePath(rel)) continue;
+    const p = path.join(abs, rel);
+    const stat = fs.lstatSync(p, { throwIfNoEntry: false });
+    if (stat?.isFile()) acc[rel] = fs.readFileSync(p, "utf8");
+  }
   return acc;
+}
+
+/** Contents of the protected files at a git ref. Throws when the ref itself cannot be read. */
+export function readProtectedAtRef(root: string, ref: string): ProtectedContents {
+  let sha: string;
+  try {
+    sha = git(root, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`]).trim();
+  } catch {
+    throw new Error(`Cannot read rules from "${ref}": no such commit. In CI, check out with full history (fetch-depth: 0).`);
+  }
+  const out: ProtectedContents = {};
+  for (const rel of PROTECTED_FILES) {
+    const exists = git(root, ["ls-tree", "--name-only", sha, "--", rel]).trim() !== "";
+    out[rel] = exists ? git(root, ["show", `${sha}:./${rel}`]) : null;
+  }
+  return out;
+}
+
+export function readProtected(root: string): ProtectedContents {
+  return Object.fromEntries(PROTECTED_FILES.map((rel) => [rel, readIfExists(root, rel) ?? null]));
 }
 
 export function buildGraph(root: string, opts: BuildGraphOptions = {}): ProjectGraph {
@@ -42,14 +93,18 @@ export function loadArchitecture(root: string): Architecture {
   if (!fs.existsSync(p)) {
     throw new Error(`No ${ARCH_FILE} found in ${root}. Run "voxium init" first.`);
   }
+  return parseArchitecture(fs.readFileSync(p, "utf8"));
+}
+
+export function parseArchitecture(text: string, label: string = ARCH_FILE): Architecture {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(p, "utf8"));
+    parsed = JSON.parse(text);
   } catch (err) {
-    throw new Error(`${ARCH_FILE} is not valid JSON: ${(err as Error).message}`);
+    throw new Error(`${label} is not valid JSON: ${(err as Error).message}`);
   }
   const res = validateArchitecture(parsed);
-  if (!res.ok) throw new Error(`${ARCH_FILE} is invalid:\n  ${res.errors.join("\n  ")}`);
+  if (!res.ok) throw new Error(`${label} is invalid:\n  ${res.errors.join("\n  ")}`);
   return parsed as Architecture;
 }
 
@@ -60,14 +115,7 @@ export function writeJson(root: string, rel: string, data: unknown): void {
 }
 
 export function loadBaseline(root: string): string[] {
-  const p = path.join(root, BASELINE_FILE);
-  if (!fs.existsSync(p)) return [];
-  try {
-    const data = JSON.parse(fs.readFileSync(p, "utf8"));
-    return Array.isArray(data.violations) ? data.violations : [];
-  } catch {
-    return [];
-  }
+  return parseBaseline(readIfExists(root, BASELINE_FILE)) ?? [];
 }
 
 export function saveBaseline(root: string, ids: string[]): void {

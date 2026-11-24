@@ -39,7 +39,7 @@ const template = {
   callback_urls: ["{{APP_URL}}/api/auth/callback"],
   setup_url: "{{APP_URL}}/dashboard",
   default_permissions: { metadata: "read", contents: "write", pull_requests: "write", statuses: "write", workflows: "write" },
-  default_events: ["pull_request"],
+  default_events: ["pull_request", "pull_request_review"],
 };
 document.getElementById("f").addEventListener("submit", (e) => {
   const base = document.getElementById("url").value.trim().replace(/\/+$/, "");

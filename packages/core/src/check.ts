@@ -3,6 +3,7 @@ import type {
   Architecture,
   CheckResult,
   Exception,
+  ImportEdge,
   ProjectGraph,
   Rule,
   Violation,
@@ -20,6 +21,97 @@ export function assignModules(arch: Architecture, files: string[]): Map<string, 
     }
   }
   return map;
+}
+
+/** Drop files the architecture explicitly ignores, and every import from or to them. */
+export function withoutIgnored(graph: ProjectGraph, ignore: string[] | undefined): ProjectGraph {
+  if (!ignore?.length) return graph;
+  const files = graph.files.filter((f) => !matchesAny(f, ignore));
+  if (files.length === graph.files.length) return graph;
+  const keep = new Set(files);
+  return { ...graph, files, edges: graph.edges.filter((e) => keep.has(e.from) && (!e.to || keep.has(e.to))) };
+}
+
+export interface Dependency {
+  /** File inside a module that has the dependency. */
+  from: string;
+  fromMod: string;
+  /** Target file and its module, for internal dependencies. */
+  to?: string;
+  toMod?: string;
+  /** Target package, for external dependencies. */
+  pkg?: string;
+  /** The file outside every module that the dependency passes through, when it is indirect. */
+  via?: string;
+}
+
+const TEST_FILE = /(?:^|\/)__tests__\/|\.(?:test|spec)\.[^/]+$/;
+
+/**
+ * Everything module files depend on, directly or through files that belong to no module.
+ * Unassigned files are transparent: importing one means depending on whatever it leads to. Without this,
+ * a file placed outside the modules could be used to pass any import around the rules.
+ * Test files that nothing imports are checked on direct imports only, so shared test helpers stay usable.
+ */
+export function moduleDependencies(graph: ProjectGraph, modOf: Map<string, string>): Dependency[] {
+  const outgoing = new Map<string, ImportEdge[]>();
+  const imported = new Set<string>();
+  for (const e of graph.edges) {
+    if (e.to) imported.add(e.to);
+    if (modOf.has(e.from)) continue;
+    const list = outgoing.get(e.from);
+    if (list) list.push(e);
+    else outgoing.set(e.from, [e]);
+  }
+
+  type Reach = { modules: Map<string, string>; pkgs: Set<string> };
+  const memo = new Map<string, Reach>();
+  const reach = (start: string): Reach => {
+    const hit = memo.get(start);
+    if (hit) return hit;
+    const found: Reach = { modules: new Map(), pkgs: new Set() };
+    const seen = new Set([start]);
+    const queue = [start];
+    for (let i = 0; i < queue.length; i++) {
+      for (const e of outgoing.get(queue[i]) ?? []) {
+        if (e.pkg) found.pkgs.add(e.pkg);
+        if (!e.to) continue;
+        const mod = modOf.get(e.to);
+        if (mod) {
+          if (!found.modules.has(mod)) found.modules.set(mod, e.to);
+        } else if (!seen.has(e.to)) {
+          seen.add(e.to);
+          queue.push(e.to);
+        }
+      }
+    }
+    memo.set(start, found);
+    return found;
+  };
+
+  const out: Dependency[] = [];
+  for (const e of graph.edges) {
+    const from = e.from;
+    const fromMod = modOf.get(from);
+    if (!fromMod) continue;
+    if (e.pkg) {
+      out.push({ from, fromMod, pkg: e.pkg });
+      continue;
+    }
+    if (!e.to) continue;
+    const toMod = modOf.get(e.to);
+    if (toMod) {
+      if (toMod !== fromMod) out.push({ from, fromMod, to: e.to, toMod });
+      continue;
+    }
+    if (TEST_FILE.test(from) && !imported.has(from)) continue;
+    const r = reach(e.to);
+    for (const [mod, file] of r.modules) {
+      if (mod !== fromMod) out.push({ from, fromMod, to: file, toMod: mod, via: e.to });
+    }
+    for (const pkg of r.pkgs) out.push({ from, fromMod, pkg, via: e.to });
+  }
+  return out;
 }
 
 /** Tarjan strongly connected components over a module graph. */
@@ -74,9 +166,10 @@ export interface CheckOptions {
 
 export function checkArchitecture(
   arch: Architecture,
-  graph: ProjectGraph,
+  input: ProjectGraph,
   opts: CheckOptions = {},
 ): CheckResult {
+  const graph = withoutIgnored(input, arch.ignore);
   const modOf = assignModules(arch, graph.files);
   const violations: Violation[] = [];
   const layerIndex = new Map(arch.layers.map((m, i) => [m, i]));
@@ -95,20 +188,20 @@ export function checkArchitecture(
   const moduleEdges = new Map<string, Set<string>>();
   const evidence = new Map<string, { from: string; to: string }>();
 
-  for (const e of graph.edges) {
-    const fromMod = modOf.get(e.from);
-    if (!fromMod) continue;
+  for (const d of moduleDependencies(graph, modOf)) {
+    const through = d.via ? ` through ${d.via}, which is outside every module` : "";
+    const viaFix = d.via ? ` Or assign ${d.via} to a module so its own imports are checked.` : "";
 
-    if (e.pkg) {
+    if (d.pkg) {
       for (const r of denyExt) {
-        if (r.module === fromMod && r.packages.includes(e.pkg)) {
+        if (r.module === d.fromMod && r.packages.includes(d.pkg)) {
           add({
             ruleId: r.id,
             severity: r.severity,
-            file: e.from,
-            key: `${e.from}->${e.pkg}`,
-            message: `${e.from} imports package "${e.pkg}", which module "${fromMod}" must not use.`,
-            fix: `Move this usage into the module that is allowed to use "${e.pkg}" and call it from there.`,
+            file: d.from,
+            key: d.via ? `${d.from}->${d.via}=>${d.pkg}` : `${d.from}->${d.pkg}`,
+            message: `${d.from} ${d.via ? "reaches" : "imports"} package "${d.pkg}"${through}, which module "${d.fromMod}" must not use.`,
+            fix: `Move this usage into the module that is allowed to use "${d.pkg}" and call it from there.${viaFix}`,
             rationale: r.rationale,
           });
         }
@@ -116,13 +209,16 @@ export function checkArchitecture(
       continue;
     }
 
-    const toMod = e.to ? modOf.get(e.to) : undefined;
-    if (!e.to || !toMod || toMod === fromMod) continue;
+    if (!d.to || !d.toMod) continue;
+    const { fromMod, toMod } = d;
+    // Indirect dependencies are identified per target module, so unrelated edits do not change the id.
+    const key = d.via ? `${d.from}->${d.via}=>${toMod}` : `${d.from}->${d.to}`;
+    const verb = d.via ? "reaches" : "imports";
 
     if (!moduleEdges.has(fromMod)) moduleEdges.set(fromMod, new Set());
     moduleEdges.get(fromMod)!.add(toMod);
     const ek = `${fromMod}>${toMod}`;
-    if (!evidence.has(ek)) evidence.set(ek, { from: e.from, to: e.to });
+    if (!evidence.has(ek)) evidence.set(ek, { from: d.from, to: d.to });
 
     if (layersRule) {
       const a = layerIndex.get(fromMod);
@@ -131,10 +227,10 @@ export function checkArchitecture(
         add({
           ruleId: layersRule.id,
           severity: layersRule.severity,
-          file: e.from,
-          key: `${e.from}->${e.to}`,
-          message: `${e.from} (${fromMod}) imports ${e.to} (${toMod}). Layer order puts ${toMod} above ${fromMod}.`,
-          fix: `Invert the dependency: have ${toMod} pass the data in, or move the shared code into a lower layer such as "${arch.layers[arch.layers.length - 1]}".`,
+          file: d.from,
+          key,
+          message: `${d.from} (${fromMod}) ${verb} ${d.to} (${toMod})${through}. Layer order puts ${toMod} above ${fromMod}.`,
+          fix: `Invert the dependency: have ${toMod} pass the data in, or move the shared code into a lower layer such as "${arch.layers[arch.layers.length - 1]}".${viaFix}`,
           rationale: layersRule.rationale,
         });
       }
@@ -145,10 +241,10 @@ export function checkArchitecture(
         add({
           ruleId: r.id,
           severity: r.severity,
-          file: e.from,
-          key: `${e.from}->${e.to}`,
-          message: `${e.from} imports ${e.to}. Module "${fromMod}" must not depend on "${toMod}".`,
-          fix: `Go through an allowed module instead of importing "${toMod}" directly.`,
+          file: d.from,
+          key,
+          message: `${d.from} ${verb} ${d.to}${through}. Module "${fromMod}" must not depend on "${toMod}".`,
+          fix: `Go through an allowed module instead of importing "${toMod}" directly.${viaFix}`,
           rationale: r.rationale,
         });
       }

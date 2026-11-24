@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildGraph } from "./node.js";
+import { buildGraph, readProjectFiles, readProtectedAtRef } from "./node.js";
 import {
   buildGraphFromFiles,
   extractImports,
@@ -14,6 +15,11 @@ import {
   validateArchitecture,
   renderAgentRules,
   BLOCK_START,
+  moduleDependencies,
+  assignModules,
+  detectBuildOutput,
+  findProtectedChanges,
+  tightenBaseline,
   type Architecture,
 } from "./index.js";
 
@@ -217,5 +223,117 @@ describe("schema and generation", () => {
     expect(second.match(/voxium:start/g)).toHaveLength(1);
     expect(second).toContain("Keep this.");
     expect(second.indexOf("`data`")).toBeLessThan(second.indexOf("`ui`"));
+  });
+});
+
+const ids = (files: Record<string, string>, arch: Architecture = base) =>
+  failing(checkArchitecture(arch, buildGraphFromFiles(files))).map((v) => v.id);
+
+describe("files outside modules", () => {
+  it("cannot be used to pass an import around the layers", () => {
+    expect(
+      ids({
+        "src/ui/a.ts": "export {};",
+        "src/bridge.ts": `export * from "./hop";`,
+        "src/hop.ts": `export * from "./ui/a"; import "./bridge";`,
+        "src/data/d.ts": `import "../bridge";`,
+      }),
+    ).toEqual(["L1:src/data/d.ts->src/bridge.ts=>ui"]);
+  });
+
+  it("cannot be used to reach a denied package or to hide a cycle", () => {
+    expect(ids({ "src/db.ts": `import "pg";`, "src/ui/a.ts": `import "../db";` })).toEqual(["E1:src/ui/a.ts->src/db.ts=>pg"]);
+    const noLayers: Architecture = { ...base, layers: [] };
+    expect(
+      ids({ "src/ui/a.ts": `import "../services/s";`, "src/services/s.ts": `import "../x";`, "src/x.ts": `import "./ui/a";` }, noLayers),
+    ).toEqual(["C1:services+ui"]);
+  });
+
+  it("may be imported when they only lead downward, and may import anything themselves", () => {
+    expect(ids({ "src/main.ts": `import "./ui/a"; import "./data/d";`, "src/ui/a.ts": `import "../x";`, "src/x.ts": `import "./data/d";`, "src/data/d.ts": "" })).toEqual([]);
+  });
+
+  it("lets stand alone tests share helpers, but not a test file that other code imports", () => {
+    const helper = { "test/utils.ts": `import "../src/ui/a";`, "src/ui/a.ts": "", "src/data/d.test.ts": `import "../../test/utils";` };
+    expect(ids(helper)).toEqual([]);
+    expect(ids({ ...helper, "src/data/d.ts": `import "./d.test";` })).toEqual(["L1:src/data/d.test.ts->test/utils.ts=>ui"]);
+  });
+
+  it("gives the same answer with many files importing each other", () => {
+    const files: Record<string, string> = { "src/ui/a.ts": "", "src/data/d.ts": `import "../u0";` };
+    for (let i = 0; i < 2000; i++) files[`src/u${i}.ts`] = `import "./u${(i + 1) % 2000}"; import "./u${(i * 7) % 2000}";`;
+    files["src/u1999.ts"] += `import "./ui/a";`;
+    const g = buildGraphFromFiles(files);
+    const deps = moduleDependencies(g, assignModules(base, g.files));
+    expect(deps).toEqual([{ from: "src/data/d.ts", fromMod: "data", to: "src/ui/a.ts", toMod: "ui", via: "src/u0.ts" }]);
+  });
+});
+
+describe("ignored files", () => {
+  it.each(["build", "out", "dist", "voxium", ".cache", "coverage"])("code in a committed folder named %s is still checked", (dir) => {
+    expect(ids({ "src/ui/a.ts": "", [`src/data/${dir}/d.js`]: `import "../../ui/a";` })).toHaveLength(1);
+    expect(ids({ "src/ui/a.ts": "", [`${dir}/b.ts`]: `import "../src/ui/a";`, "src/data/d.ts": `import "../../${dir}/b";` })).toHaveLength(1);
+  });
+
+  it("skips only what the architecture ignores", () => {
+    const files = { "src/ui/a.ts": "", "src/data/gen/d.ts": `import "../../ui/a";` };
+    expect(ids(files)).toHaveLength(1);
+    expect(ids(files, { ...base, ignore: ["src/data/gen/**"] })).toEqual([]);
+    expect(validateArchitecture({ ...base, ignore: [1] }).ok).toBe(false);
+  });
+
+  it("proposes ignoring committed build output, never source", () => {
+    expect(detectBuildOutput(["dist/index.js", "packages/a/dist/x.mjs", "src/build/x.js", "build/tool.ts", "out/a.js", "out/b.ts"])).toEqual([
+      "dist/**",
+      "packages/a/dist/**",
+    ]);
+  });
+});
+
+describe("protected files", () => {
+  const A = "voxium/architecture.json";
+  it("notices deletion and edits, but not a branch that is behind", () => {
+    expect(findProtectedChanges({ [A]: "1" }, { [A]: "1" }, {})).toEqual([A]);
+    expect(findProtectedChanges({ [A]: "1" }, { [A]: "1" }, { [A]: "2" })).toEqual([A]);
+    expect(findProtectedChanges({ [A]: "2" }, { [A]: "1" }, { [A]: "1" })).toEqual([]);
+    expect(findProtectedChanges({ [A]: "2" }, { [A]: "1" }, { [A]: "2" })).toEqual([]);
+  });
+
+  it("only ever makes the baseline stricter", () => {
+    const b = (...violations: string[]) => JSON.stringify({ violations });
+    expect(tightenBaseline(b("x", "y"), b("x"))).toEqual(["x"]);
+    expect(tightenBaseline(b("x"), b("x", "y"))).toEqual(["x"]);
+    expect(tightenBaseline(b("x"), "{")).toEqual(["x"]);
+    expect(tightenBaseline(b("x"), null)).toEqual([]);
+  });
+});
+
+describe("git", () => {
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=t", ...args], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString();
+
+  it("reads what could be committed, and rules only from the ref asked for", () => {
+    const root = project({
+      ".gitignore": "dist\n",
+      "dist/out.js": "1",
+      "src/build/a.js": "1",
+      "src/b.ts": "1",
+      "voxium/architecture.json": "base",
+    });
+    git(root, "init", "-q", "-b", "main");
+    git(root, "add", "-A");
+    git(root, "commit", "-qm", "x");
+    fs.writeFileSync(path.join(root, "src/new.ts"), "1");
+    fs.writeFileSync(path.join(root, "voxium/architecture.json"), "edited");
+    expect(Object.keys(readProjectFiles(root)).sort()).toEqual(["src/b.ts", "src/build/a.js", "src/new.ts"]);
+
+    git(root, "add", "-f", "dist/out.js"); // force added, so it would be committed
+    expect(Object.keys(readProjectFiles(root))).toContain("dist/out.js");
+
+    const rules = readProtectedAtRef(root, "main");
+    expect(rules["voxium/architecture.json"]).toBe("base");
+    expect(rules["voxium/baseline.json"]).toBeNull();
+    expect(() => readProtectedAtRef(root, "nope")).toThrow(/no such commit/);
+    expect(() => readProtectedAtRef(root, "--help")).toThrow(/no such commit/);
   });
 });

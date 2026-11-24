@@ -1,6 +1,7 @@
 /**
  * Streaming tar.gz reader. Memory stays bounded: only files the caller wants (and that are
- * small enough) are kept, everything else is skipped as it streams past.
+ * small enough) are kept, everything else is skipped as it streams past. The result can therefore be
+ * incomplete, so compare it with the commit's file list (see uncheckedPaths) before trusting a pass.
  * Handles ustar prefixes, pax extended headers (what GitHub tarballs use) and GNU long names.
  */
 
@@ -67,15 +68,16 @@ function octal(b: Uint8Array, start: number, len: number): number {
   return s ? parseInt(s, 8) : 0;
 }
 
-function parsePax(text: string): Record<string, string> {
+/** Record lengths count bytes, not characters, so this works on the raw bytes. */
+function parsePax(bytes: Uint8Array): Record<string, string> {
   const out: Record<string, string> = {};
   let i = 0;
-  while (i < text.length) {
-    const sp = text.indexOf(" ", i);
+  while (i < bytes.length) {
+    const sp = bytes.indexOf(0x20, i);
     if (sp === -1) break;
-    const total = parseInt(text.slice(i, sp), 10);
+    const total = parseInt(dec.decode(bytes.subarray(i, sp)), 10);
     if (!total) break;
-    const rec = text.slice(sp + 1, i + total - 1); // drop trailing newline
+    const rec = dec.decode(bytes.subarray(sp + 1, i + total - 1)); // drop trailing newline
     const eq = rec.indexOf("=");
     if (eq !== -1) out[rec.slice(0, eq)] = rec.slice(eq + 1);
     i += total;
@@ -119,9 +121,9 @@ export async function readTarGz(
     if (type === "x" || type === "L") {
       const body = await reader.take(padded);
       if (!body) break;
-      const text = dec.decode(body.subarray(0, size));
-      if (type === "x") paxPath = parsePax(text).path ?? paxPath;
-      else gnuLong = text.replace(/\0+$/, "");
+      const data = body.subarray(0, size);
+      if (type === "x") paxPath = parsePax(data).path ?? paxPath;
+      else gnuLong = dec.decode(data).replace(/\0+$/, "");
       continue;
     }
     if (type === "g" || type === "K") {

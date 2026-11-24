@@ -53,6 +53,8 @@ export interface Architecture {
   layers: string[];
   rules: Rule[];
   exceptions: Exception[];
+  /** Globs for files that are not source, for example committed build output. They are not checked. */
+  ignore?: string[];
   meta?: { approvedBy?: string; updated?: string };
 }
 

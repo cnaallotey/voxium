@@ -112,10 +112,67 @@ export async function getFileAtRef(token: string, fullName: string, path: string
   return res.text();
 }
 
+/** Commit a branch points at. Uses the full branch ref, so a tag with the same name cannot stand in for it. */
+export async function getBranchSha(token: string, fullName: string, branch: string): Promise<string> {
+  const ref = branch.split("/").map(encodeURIComponent).join("/");
+  const data = await ok<{ object: { sha: string } }>(await gh(token, `/repos/${fullName}/git/ref/heads/${ref}`), "read branch");
+  return data.object.sha;
+}
+
+/** The commit where head branched off base. */
+export async function getMergeBase(token: string, fullName: string, baseSha: string, headSha: string): Promise<string> {
+  const data = await ok<{ merge_base_commit: { sha: string } }>(
+    await gh(token, `/repos/${fullName}/compare/${baseSha}...${headSha}?per_page=1`),
+    "compare",
+  );
+  return data.merge_base_commit.sha;
+}
+
+/**
+ * Every file path in a commit, or null when GitHub cannot list them all. The tarball alone is not proof of
+ * what a commit holds: .gitattributes "export-ignore" removes files from it.
+ */
+export async function listTreePaths(token: string, fullName: string, sha: string): Promise<string[] | null> {
+  const data = await ok<{ truncated: boolean; tree: Array<{ path: string; type: string }> }>(
+    await gh(token, `/repos/${fullName}/git/trees/${sha}?recursive=1`),
+    "list files",
+  );
+  return data.truncated ? null : data.tree.filter((t) => t.type === "blob").map((t) => t.path);
+}
+
+export interface GhReview {
+  user: { id: number; login: string; type: string } | null;
+  state: string;
+  commit_id: string | null;
+}
+
+/** All reviews, oldest first. Throws rather than returning part of a very long list. */
+export async function listReviews(token: string, fullName: string, number: number): Promise<GhReview[]> {
+  const out: GhReview[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const data = await ok<GhReview[]>(
+      await gh(token, `/repos/${fullName}/pulls/${number}/reviews?per_page=100&page=${page}`),
+      "list reviews",
+    );
+    out.push(...data);
+    if (data.length < 100) return out;
+  }
+  throw new Error("GitHub list reviews failed: too many reviews to read");
+}
+
+/** True when the user can push to the repo. */
+export async function canWrite(token: string, fullName: string, login: string): Promise<boolean> {
+  const res = await gh(token, `/repos/${fullName}/collaborators/${encodeURIComponent(login)}/permission`);
+  if (res.status === 404) return false;
+  const { permission } = await ok<{ permission: string }>(res, "read permission");
+  return permission === "admin" || permission === "write";
+}
+
 export async function setCommitStatus(
   token: string,
   fullName: string,
   sha: string,
+  context: string,
   state: "success" | "failure" | "pending" | "error",
   description: string,
   targetUrl?: string,
@@ -124,7 +181,7 @@ export async function setCommitStatus(
     method: "POST",
     body: JSON.stringify({
       state,
-      context: "voxium/rules",
+      context,
       description: description.slice(0, 140),
       ...(targetUrl ? { target_url: targetUrl } : {}),
     }),

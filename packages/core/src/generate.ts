@@ -52,18 +52,27 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   architecture:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # The rules come from the default branch, so a pull request cannot pass by editing its own rules.
+      # Running from an empty folder keeps npx from picking up a "voxium" the pull request ships itself.
       - name: Check architecture
-        run: npx voxium check --format github
+        working-directory: \${{ runner.temp }}
+        env:
+          # The full ref name, because a tag called "origin/main" would win over the branch.
+          RULES_FROM: refs/remotes/origin/\${{ github.event.repository.default_branch }}
+        run: npx --yes voxium check --root "$GITHUB_WORKSPACE/repo" --rules-from "$RULES_FROM" --format github
 `;
 }
 
@@ -73,7 +82,8 @@ export function renderCodeowners(owner = "@your-team-leaders"): string {
 /voxium/ ${owner}
 /CLAUDE.md ${owner}
 /AGENTS.md ${owner}
-/.github/workflows/voxium.yml ${owner}
+# A pull request can edit the workflows that check it, and these owners, so both need review too.
+/.github/ ${owner}
 `;
 }
 

@@ -81,5 +81,9 @@ export function validateArchitecture(input: unknown): ValidationResult {
     }
   }
 
+  if (a.ignore !== undefined && (!Array.isArray(a.ignore) || a.ignore.some((g) => typeof g !== "string" || !g))) {
+    errors.push("ignore must be an array of globs.");
+  }
+
   return { ok: errors.length === 0, errors };
 }

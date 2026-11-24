@@ -6,6 +6,8 @@ import {
   failing,
   inferArchitecture,
   buildSetupFiles,
+  findProtectedChanges,
+  tightenBaseline,
 } from "@voxium/core";
 import {
   ARCH_FILE,
@@ -13,7 +15,10 @@ import {
   buildGraph,
   loadArchitecture,
   loadBaseline,
+  parseArchitecture,
   readIfExists,
+  readProtected,
+  readProtectedAtRef,
   saveBaseline,
   writeJson,
   writeText,
@@ -35,6 +40,8 @@ Commands:
 Options:
   --root <dir>        Project root (default: current directory)
   --format <fmt>      check output: text (default), json, github
+  --rules-from <ref>  check: take the rules and baseline from a git ref, such as origin/main,
+                      so a change is not judged by its own edits to them
   --update-baseline   check: accept all current violations as baseline debt
   --force             init: overwrite an existing architecture file
   -h, --help          Show this help
@@ -45,6 +52,7 @@ interface Args {
   root: string;
   format: "text" | "json" | "github";
   updateBaseline: boolean;
+  rulesFrom?: string;
   force: boolean;
   help: boolean;
 }
@@ -59,6 +67,10 @@ function parseArgs(argv: string[]): Args {
       const f = argv[++i];
       if (f !== "text" && f !== "json" && f !== "github") throw new Error(`Unknown format "${f}".`);
       args.format = f;
+    } else if (a === "--rules-from") {
+      const ref = argv[++i];
+      if (!ref) throw new Error("--rules-from needs a git ref.");
+      args.rulesFrom = ref;
     } else if (a === "--update-baseline") args.updateBaseline = true;
     else if (a === "--force") args.force = true;
     else if (!args.cmd && !a.startsWith("-")) args.cmd = a;
@@ -129,6 +141,49 @@ function reportGithub(result: CheckResult): void {
   reportText(result);
 }
 
+function report(result: CheckResult, format: Args["format"]): number {
+  if (format === "json") console.log(JSON.stringify(result, null, 2));
+  else if (format === "github") reportGithub(result);
+  else reportText(result);
+  return failing(result).length > 0 || result.expiredExceptions.length > 0 ? 1 : 0;
+}
+
+/** Check the working tree by the rules at a trusted git ref instead of its own. */
+function checkAgainstRef(root: string, ref: string, format: Args["format"]): number {
+  const trusted = readProtectedAtRef(root, ref);
+  const own = readProtected(root);
+  const archText = trusted[ARCH_FILE];
+  if (archText === null || archText === undefined) {
+    if (own[ARCH_FILE] === null) {
+      console.error(`${ARCH_FILE} exists neither here nor on ${ref}. Restore it or remove the Voxium workflow.`);
+      return 1;
+    }
+    loadArchitecture(root); // the setup change itself: the new rules must at least be valid
+    console.error(`Voxium is not set up on ${ref} yet, so there are no approved rules to enforce.`);
+    return 0;
+  }
+
+  const changed = findProtectedChanges(trusted, trusted, own);
+  if (changed.length) {
+    const msg = `${changed.join(", ")} changed. The rules from ${ref} still apply here. Merging needs Team Leader approval.`;
+    if (format === "github") console.log(`::warning::${msg}`);
+    else console.error(`WARNING: ${msg}`);
+  }
+  // Rules that do not parse would break every later check, so never let them through.
+  const ownArch = own[ARCH_FILE] ? loadArchitecture(root) : null;
+
+  const arch = parseArchitecture(archText, `${ARCH_FILE} on ${ref}`);
+  const baseline = tightenBaseline(trusted[BASELINE_FILE], own[BASELINE_FILE]);
+  const result = checkArchitecture(arch, buildGraph(root), { baseline });
+  // Removing an expired exception is the fix for it, so it must not keep failing the change that removes it.
+  if (ownArch) {
+    result.expiredExceptions = result.expiredExceptions.filter((ex) =>
+      ownArch.exceptions.some((o) => o.rule === ex.rule && o.file === ex.file),
+    );
+  }
+  return report(result, format);
+}
+
 function main(): number {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || !args.cmd) {
@@ -179,6 +234,10 @@ function main(): number {
     }
 
     case "check": {
+      if (args.rulesFrom) {
+        if (args.updateBaseline) throw new Error("--rules-from cannot be combined with --update-baseline.");
+        return checkAgainstRef(root, args.rulesFrom, args.format);
+      }
       const arch = loadArchitecture(root);
       const graph = buildGraph(root);
       let baseline = loadBaseline(root);
@@ -189,11 +248,7 @@ function main(): number {
         result = checkArchitecture(arch, graph, { baseline });
         console.error(`Baseline updated with ${baseline.length} violation(s). Only a Team Leader should approve this change.`);
       }
-      if (args.format === "json") console.log(JSON.stringify(result, null, 2));
-      else if (args.format === "github") reportGithub(result);
-      else reportText(result);
-      const expired = result.expiredExceptions.length > 0;
-      return failing(result).length > 0 || expired ? 1 : 0;
+      return report(result, args.format);
     }
 
     case "mcp":

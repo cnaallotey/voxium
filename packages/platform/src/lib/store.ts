@@ -121,8 +121,16 @@ export async function getRepo(db: D1Database, id: number): Promise<RepoRow | nul
   return db.prepare("SELECT * FROM repos WHERE id = ?").bind(id).first<RepoRow>();
 }
 
-export async function getRepoByFullName(db: D1Database, fullName: string): Promise<RepoRow | null> {
-  return db.prepare("SELECT * FROM repos WHERE full_name = ?").bind(fullName).first<RepoRow>();
+export async function getRepoByGithubId(db: D1Database, githubRepoId: number): Promise<RepoRow | null> {
+  return db.prepare("SELECT * FROM repos WHERE github_repo_id = ?").bind(githubRepoId).first<RepoRow>();
+}
+
+export async function getRoleByGithubUser(db: D1Database, githubUserId: number, orgId: number): Promise<Role | null> {
+  const r = await db
+    .prepare("SELECT m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.github_id = ? AND m.org_id = ?")
+    .bind(githubUserId, orgId)
+    .first<{ role: Role }>();
+  return r?.role ?? null;
 }
 
 export async function getOrg(db: D1Database, id: number): Promise<OrgRow | null> {

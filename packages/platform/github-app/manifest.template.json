@@ -14,5 +14,5 @@
     "statuses": "write",
     "workflows": "write"
   },
-  "default_events": ["pull_request"]
+  "default_events": ["pull_request", "pull_request_review"]
 }

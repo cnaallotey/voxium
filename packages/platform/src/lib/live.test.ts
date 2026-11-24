@@ -16,8 +16,11 @@ describe.runIf(Boolean(target))("live GitHub repo", () => {
     const stream = await fetchTarball(process.env.VOXIUM_GITHUB_TOKEN ?? "", target!, "HEAD");
     const files = await readTarGz(stream, { want: wantFile });
     const plan = prepareSetup(files);
-    const arch = plan.setupFiles["voxium/architecture.json"];
-    const res = checkPullRequest(files, arch, plan.setupFiles["voxium/baseline.json"], arch);
+    const rules = {
+      "voxium/architecture.json": plan.setupFiles["voxium/architecture.json"],
+      "voxium/baseline.json": plan.setupFiles["voxium/baseline.json"],
+    };
+    const res = checkPullRequest({ headFiles: files, treePaths: Object.keys(files), base: rules, mergeBase: rules, head: rules });
     console.log(
       JSON.stringify(
         {

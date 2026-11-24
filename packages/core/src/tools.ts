@@ -26,6 +26,7 @@ export function getArchitectureSummary(ctx: ToolContext) {
       rationale: r.rationale,
     })),
     exceptions: ctx.arch.exceptions.map((e) => ({ rule: e.rule, file: e.file, expires: e.expires })),
+    ignore: ctx.arch.ignore ?? [],
   };
 }
 
@@ -35,7 +36,7 @@ export function getRulesForPath(ctx: ToolContext, filePath: string) {
     return {
       path: filePath,
       module: null,
-      note: "This path is not inside any module, so Voxium does not check it. Consider whether it belongs in an existing module.",
+      note: "This path is not inside any module. Modules that import it are treated as importing everything it leads to, so it cannot be used to get around the rules. Consider whether it belongs in an existing module.",
       modules: Object.keys(ctx.arch.modules),
     };
   }
@@ -69,11 +70,16 @@ export function checkImport(ctx: ToolContext, fromPath: string, target: string) 
   const isPackage = !target.includes("/") || target.startsWith("@");
   const toPath = isPackage ? undefined : target;
   const files = isPackage ? [fromPath] : [fromPath, target];
+  const planned = isPackage ? { from: fromPath, pkg: target, specifier: target } : { from: fromPath, to: toPath, specifier: target };
+  // A target outside every module stands for whatever it leads to, so include the existing code around it.
+  const project = !isPackage && !assignModules(ctx.arch, [target]).size ? buildGraphFromFiles(ctx.files) : null;
+  const projectFiles = project ? [...new Set([...project.files, ...files])] : files;
+  const assigned = assignModules(ctx.arch, projectFiles);
   const graph = {
     root: ".",
-    files,
+    files: projectFiles,
     lines: {},
-    edges: [isPackage ? { from: fromPath, pkg: target, specifier: target } : { from: fromPath, to: toPath, specifier: target }],
+    edges: [planned, ...(project?.edges.filter((e) => !assigned.has(e.from)) ?? [])],
   };
   const res = checkArchitecture(ctx.arch, graph);
   const blocking = res.violations.filter((v) => !v.excepted);

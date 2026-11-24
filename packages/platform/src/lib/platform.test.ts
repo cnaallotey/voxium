@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { checkPullRequest, prepareSetup, wantFile } from "./analysis";
+import { checkPullRequest, prepareSetup, wantFile, type PrCheckInput } from "./analysis";
 import { hmacSha256Hex, safeEqual, verifyWebhookSignature } from "./crypto";
 import { createAppJwt, createSetupPr, pkcs1ToPkcs8 } from "./github";
 import { createSessionToken, readSessionToken } from "./session";
@@ -59,11 +59,20 @@ describe("tar reader", () => {
     });
   });
 
+  // Packs <parent>/repo-sha. GNU tar and macOS bsdtar differ in flags and in the name of the GNU format.
+  const bsd = execFileSync("tar", ["--version"]).toString().includes("bsdtar");
+  function pack(parent: string, out: string, format?: string) {
+    const name = format === "gnu" && bsd ? "gnutar" : format;
+    execFileSync("tar", [...(name ? [`--format=${name}`] : []), "-czf", out, "-C", parent, "repo-sha"], {
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
+  }
+
   it.each(["gnu", "ustar", "pax"])("reads %s format tarballs including long paths", async (format) => {
-    const dir = tmp();
-    seedRepo(dir);
+    const parent = tmp();
+    seedRepo(path.join(parent, "repo-sha"));
     const out = path.join(tmp(), `repo-${format}.tar.gz`);
-    execFileSync("tar", [`--format=${format}`, "--transform", "s,^\\.,repo-sha,", "-czf", out, "-C", dir, "."]);
+    pack(parent, out, format);
     const files = await readTarGz(stream(out), { want });
     expect(files["src/ui/Page.ts"]).toContain("services/s");
     expect(files[`src/shared/${longDir}/deep.ts`]).toContain("deep");
@@ -71,14 +80,31 @@ describe("tar reader", () => {
   });
 
   it("skips files over the size limit and respects the keep budget", async () => {
-    const dir = tmp();
-    fs.mkdirSync(path.join(dir, "src"));
+    const parent = tmp();
+    const dir = path.join(parent, "repo-sha");
+    fs.mkdirSync(path.join(dir, "src"), { recursive: true });
     fs.writeFileSync(path.join(dir, "src/big.ts"), "x".repeat(5000));
     fs.writeFileSync(path.join(dir, "src/small.ts"), "ok");
     const out = path.join(tmp(), "r.tar.gz");
-    execFileSync("tar", ["--transform", "s,^\\.,repo-sha,", "-czf", out, "-C", dir, "."]);
+    pack(parent, out);
     const files = await readTarGz(stream(out), { want, maxFileBytes: 1000 });
     expect(Object.keys(files)).toEqual(["src/small.ts"]);
+  });
+});
+
+describe("tar paths", () => {
+  it("reads long non ASCII paths from pax headers exactly", async () => {
+    const dir = tmp();
+    const rel = `src/${"é".repeat(40)}/${"ü".repeat(40)}/a.ts`;
+    fs.mkdirSync(path.join(dir, path.dirname(rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), "export {};\n");
+    execFileSync("git", ["-c", "core.precomposeunicode=false", "init", "-q"], { cwd: dir });
+    execFileSync("git", ["add", "-A"], { cwd: dir });
+    execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", "x"], { cwd: dir });
+    const out = path.join(tmp(), "u.tar.gz");
+    execFileSync("git", ["archive", "--format=tar.gz", "--prefix=o-r-abc/", "-o", out, "HEAD"], { cwd: dir });
+    const files = await readTarGz(stream(out), { want: (p) => p.endsWith(".ts") });
+    expect(Object.keys(files).map((k) => k.normalize("NFC"))).toEqual([rel.normalize("NFC")]);
   });
 });
 
@@ -141,6 +167,31 @@ const goodFiles = {
   "src/data/d.ts": `export {};`,
 };
 
+const ARCH = "voxium/architecture.json";
+const BASELINE = "voxium/baseline.json";
+
+/** A PR against a base branch holding these rules. Head defaults to leaving them untouched. */
+function check(
+  headFiles: Record<string, string>,
+  rules: Record<string, string | null>,
+  over: Partial<PrCheckInput> & { headRules?: Record<string, string | null> } = {},
+) {
+  const { headRules, ...rest } = over;
+  return checkPullRequest({
+    headFiles,
+    treePaths: Object.keys(headFiles),
+    base: rules,
+    mergeBase: rules,
+    head: { ...rules, ...headRules },
+    ...rest,
+  });
+}
+
+function rulesFor(files: Record<string, string>) {
+  const plan = prepareSetup(files);
+  return { [ARCH]: plan.setupFiles[ARCH], [BASELINE]: plan.setupFiles[BASELINE] };
+}
+
 describe("analysis", () => {
   it("prepares a setup plan whose files are consistent and baseline starts green", () => {
     const plan = prepareSetup({ ...goodFiles, "CLAUDE.md": "# Mine\n" });
@@ -149,9 +200,7 @@ describe("analysis", () => {
       [".github/workflows/voxium.yml", ".mcp.json", "AGENTS.md", "CLAUDE.md", "voxium/CODEOWNERS.suggested", "voxium/architecture.json", "voxium/baseline.json"].sort(),
     );
     expect(plan.setupFiles["CLAUDE.md"]).toContain("# Mine");
-    const arch = plan.setupFiles["voxium/architecture.json"];
-    const res = checkPullRequest(goodFiles, arch, plan.setupFiles["voxium/baseline.json"], arch);
-    expect(res.state).toBe("success");
+    expect(check(goodFiles, rulesFor(goodFiles)).state).toBe("success");
   });
 
   it("wantFile keeps source and agent files only", () => {
@@ -162,42 +211,121 @@ describe("analysis", () => {
   });
 
   it("fails a PR with a new violation and uses the BASE rules, not the PR's edited rules", () => {
-    const plan = prepareSetup(goodFiles);
-    const baseArch = plan.setupFiles["voxium/architecture.json"];
-    const baseBaseline = plan.setupFiles["voxium/baseline.json"];
-
+    const rules = rulesFor(goodFiles);
     const bad = { ...goodFiles, "src/data/d.ts": `import "../ui/Page";` };
-
     // The PR also deletes the rules to try to pass.
-    const weakened = JSON.stringify({ ...JSON.parse(baseArch), rules: [] });
-    const res = checkPullRequest(bad, baseArch, baseBaseline, weakened);
+    const weakened = JSON.stringify({ ...JSON.parse(rules[ARCH]), rules: [] });
+    const res = check(bad, rules, { headRules: { [ARCH]: weakened } });
     expect(res.state).toBe("failure");
-    expect(res.architectureChanged).toBe(true);
+    expect(res.protectedChanges).toEqual([ARCH]);
     expect(res.description).toMatch(/Team Leader/);
     expect(res.newViolations.map((v) => v.ruleId).sort()).toEqual(["CYCLE01", "LAYER01"]);
   });
 
   it("skips repos that are not set up and errors on a broken architecture file", () => {
-    expect(checkPullRequest(goodFiles, null, null, null)).toMatchObject({ state: "success", skipped: true });
-    expect(checkPullRequest(goodFiles, "{not json", null, null).state).toBe("error");
-    expect(checkPullRequest(goodFiles, JSON.stringify({ version: 1 }), null, null).state).toBe("error");
+    expect(check(goodFiles, {})).toMatchObject({ state: "success", skipped: true });
+    expect(check(goodFiles, { [ARCH]: "{not json" }).state).toBe("error");
+    expect(check(goodFiles, { [ARCH]: JSON.stringify({ version: 1 }) }).state).toBe("error");
   });
 
   it("does not fail on baseline debt but fails on expired exceptions", () => {
     const dirty = { ...goodFiles, "src/data/d.ts": `import "../services/s";` };
-    const plan = prepareSetup(dirty);
-    expect(plan.baselineCount).toBeGreaterThan(0);
-    const arch = plan.setupFiles["voxium/architecture.json"];
-    const base = plan.setupFiles["voxium/baseline.json"];
-    expect(checkPullRequest(dirty, arch, base, arch).state).toBe("success");
+    const rules = rulesFor(dirty);
+    expect(JSON.parse(rules[BASELINE]).violations.length).toBeGreaterThan(0);
+    expect(check(dirty, rules).state).toBe("success");
 
     const withEx = JSON.stringify({
-      ...JSON.parse(arch),
+      ...JSON.parse(rules[ARCH]),
       exceptions: [{ rule: "LAYER01", file: "src/data/**", owner: "t", reason: "r", expires: "2020-01-01" }],
     });
-    const res = checkPullRequest(dirty, withEx, base, withEx, new Date("2026-11-24"));
+    const res = check(dirty, { ...rules, [ARCH]: withEx }, { today: new Date("2026-11-24") });
     expect(res.state).toBe("failure");
     expect(res.description).toMatch(/expired/);
+  });
+});
+
+describe("protected files", () => {
+  const rules = rulesFor(goodFiles);
+  const weak = JSON.stringify({ ...JSON.parse(rules[ARCH]), rules: [] });
+  const bad = { ...goodFiles, "src/data/d.ts": `import "../ui/Page";` };
+
+  it.each([
+    ["deletes the architecture", { [ARCH]: null }],
+    ["weakens the architecture", { [ARCH]: weak }],
+    ["adds accepted debt to the baseline", { [BASELINE]: JSON.stringify({ violations: ["LAYER01:src/data/d.ts->src/ui/Page.ts"] }) }],
+    ["breaks the baseline file", { [BASELINE]: "{" }],
+    ["adds its own workflow content", { ".github/workflows/voxium.yml": "on: push" }],
+  ])("a PR that %s fails even with clean code", (_name, headRules) => {
+    const res = check(goodFiles, rules, { headRules });
+    expect(res.state).toBe("failure");
+    expect(res.description).toMatch(/needs Team Leader approval/);
+  });
+
+  it("an approved change is judged by the approved rules", () => {
+    expect(check(bad, rules, { headRules: { [ARCH]: weak }, approvedBy: "lead" })).toMatchObject({ state: "success", approvedBy: "lead" });
+    expect(check(goodFiles, rules, { headRules: { [ARCH]: null }, approvedBy: "lead" }).state).toBe("success");
+    // Tightening counts too: the approved rules catch what the old ones allowed.
+    expect(check(bad, { ...rules, [ARCH]: weak }, { headRules: { [ARCH]: rules[ARCH] }, approvedBy: "lead" }).state).toBe("failure");
+  });
+
+  it("approval cannot merge invalid rules, and does nothing for PRs that only break rules", () => {
+    expect(check(goodFiles, rules, { headRules: { [ARCH]: "{" }, approvedBy: "lead" }).state).toBe("failure");
+    expect(check(bad, rules, { approvedBy: "lead" })).toMatchObject({ state: "failure", approvedBy: null });
+  });
+
+  it("approval can repair a broken base and renew an expired exception", () => {
+    expect(check(goodFiles, { ...rules, [ARCH]: "{" }, { headRules: { [ARCH]: rules[ARCH] }, approvedBy: "lead" }).state).toBe("success");
+    const ex = (expires: string) =>
+      JSON.stringify({ ...JSON.parse(rules[ARCH]), exceptions: [{ rule: "LAYER01", file: "x", owner: "o", reason: "r", expires }] });
+    const today = new Date("2026-11-24");
+    expect(check(goodFiles, { ...rules, [ARCH]: ex("2026-01-01") }, { today }).state).toBe("failure");
+    const renewed = { headRules: { [ARCH]: ex("2027-01-01") }, approvedBy: "lead", today };
+    expect(check(goodFiles, { ...rules, [ARCH]: ex("2026-01-01") }, renewed).state).toBe("success");
+  });
+
+  it("does not blame a branch that is merely behind", () => {
+    const res = checkPullRequest({
+      headFiles: goodFiles,
+      treePaths: Object.keys(goodFiles),
+      base: rules,
+      mergeBase: { ...rules, [ARCH]: weak },
+      head: { ...rules, [ARCH]: weak },
+    });
+    expect(res).toMatchObject({ state: "success", protectedChanges: [] });
+  });
+
+  it("lets a PR pay down debt without approval, but not drop debt that is still there", () => {
+    const dirty = { ...goodFiles, "src/data/d.ts": `import "../services/s";` };
+    const debt = {
+      ...rules,
+      [BASELINE]: JSON.stringify({ violations: ["LAYER01:src/data/d.ts->src/services/s.ts", "CYCLE01:data+services"] }),
+    };
+    expect(check(dirty, debt).state).toBe("success");
+    const none = { [BASELINE]: JSON.stringify({ violations: [] }) };
+    expect(check(goodFiles, debt, { headRules: none })).toMatchObject({ state: "success", protectedChanges: [] });
+    expect(check(dirty, debt, { headRules: none }).state).toBe("failure");
+  });
+});
+
+describe("complete checks", () => {
+  const rules = rulesFor(goodFiles);
+
+  it("never passes when source files could not be read", () => {
+    const res = check(goodFiles, rules, { treePaths: [...Object.keys(goodFiles), "src/data/hidden.ts", "README.md"] });
+    expect(res).toMatchObject({ state: "error", unchecked: ["src/data/hidden.ts"], uncheckedCount: 1 });
+    expect(check(goodFiles, rules, { treePaths: null }).state).toBe("error");
+  });
+
+  it("accepts files the approved architecture ignores", () => {
+    const arch = JSON.stringify({ ...JSON.parse(rules[ARCH]), ignore: ["dist/**"] });
+    const res = check(goodFiles, { ...rules, [ARCH]: arch }, { treePaths: [...Object.keys(goodFiles), "dist/bundle.js"] });
+    expect(res.state).toBe("success");
+  });
+
+  it("setup reports files it could not read and proposes ignoring committed build output", () => {
+    const plan = prepareSetup(goodFiles, [...Object.keys(goodFiles), "dist/bundle.js", "src/ui/huge.ts"]);
+    expect(JSON.parse(plan.setupFiles[ARCH]).ignore).toEqual(["dist/**"]);
+    expect(plan.unchecked).toEqual(["src/ui/huge.ts"]);
   });
 });
 

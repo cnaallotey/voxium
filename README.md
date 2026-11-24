@@ -31,11 +31,23 @@ See SPEC.md for the full product spec.
 
 How it works: the repo holds the rules (`voxium/architecture.json`). The platform reads the repo tarball in memory, never stores source, and writes results to D1. Pull requests are judged by the rules on the BASE branch, so a PR cannot weaken the rules it is checked against. Setup opens a PR, it never pushes to the default branch.
 
+## What stops a PR from getting around the rules
+
+* A PR that changes `voxium/architecture.json`, `voxium/baseline.json` or `.github/workflows/voxium.yml` fails `voxium/rules` until an Owner or Team Leader with write access approves that exact commit in a GitHub review. It is then judged by the rules they approved. Removing baseline debt needs no approval.
+* `voxium/rules` is only ever written by a check against the default branch. PRs into another branch report as `voxium/rules (branch name)`. Require that name if you protect the branch.
+* Files outside every module are followed: importing one counts as importing everything it leads to.
+* Committed files are not skipped because of their folder name. List build output in `ignore` in the architecture file.
+* If any source file cannot be read (over 1 MB, over the 40 MB total, symlinked, or excluded from archives), the check is an error, not a pass.
+
+Repository settings that this depends on: require the `voxium/rules` status **with the Voxium app as its source** (otherwise anyone who can push can post that status), require branches to be up to date, and put `voxium/CODEOWNERS.suggested` in `.github/CODEOWNERS` with code owner review required.
+
+The generated GitHub Actions job uses the rules from the default branch, but a PR can still edit workflow files. Without the platform, CODEOWNERS review is what protects them.
+
 ## Commands
 
 * `init`: infer an architecture, write it with a baseline, agent rules and the CI workflow.
 * `infer`: print the inferred architecture only.
-* `check`: exit 1 on new blocking violations. Formats: text, json, github.
+* `check`: exit 1 on new blocking violations. Formats: text, json, github. `--rules-from <ref>` takes the rules and baseline from a git ref instead of the working tree.
 * `generate`: regenerate agent rules, `.mcp.json` and the workflow from the architecture file.
 * `mcp`: run the MCP server over stdio. Tools: `get_architecture`, `get_rules_for_path`, `check_import`, `check_change`, `propose_architecture_change`.
 
@@ -48,5 +60,9 @@ How it works: the repo holds the rules (`voxium/architecture.json`). The platfor
 * TypeScript, JavaScript and Vue files only. Imports resolve relative paths and `@/`, `~/` aliases, not tsconfig `paths`.
 * Inference proposes modules from top level folders and orders layers by import direction. Modules with no imports between them are ordered arbitrarily, so review the layers.
 * Agents can suggest architecture changes through MCP (saved as pending proposals), but nothing approves them yet. The approval flow belongs to the platform.
+* Approval works through GitHub reviews, and GitHub does not let authors approve their own PR. A solo owner has to merge an architecture change with an admin override. The logged self approval in the spec is not built.
+* Approval is only as trustworthy as the roles behind it. The first person to sign in becomes Owner of an installation, which still needs a stricter rule.
+* Imports through symlinked folders, or in forms the import scanner does not recognise, are not seen.
+* Without the platform, an exception that has already expired can be removed in a PR but not renewed without an admin override.
 * Not built yet: org level approval flow for architecture changes, remote MCP server on Workers, billing, generated test files, Queues for large repos.
 * The platform has been verified with unit tests and in the local Workers runtime with a local D1. It has not been run against a real GitHub App yet.

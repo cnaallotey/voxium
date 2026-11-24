@@ -6,6 +6,11 @@ export type FileMap = Record<string, string>;
 
 export const SOURCE_EXT = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"];
 const RESOLVE_EXT = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".json"];
+/**
+ * Folder names that usually hold build output or caches. They are only a hint: used when there is no git
+ * to say what is committed, and to propose "ignore" globs at setup. A committed file is never skipped just
+ * because of its folder name, otherwise code could hide from the rules in a folder called "build".
+ */
 export const IGNORE_DIRS = new Set([
   "node_modules",
   ".git",
@@ -21,13 +26,14 @@ export const IGNORE_DIRS = new Set([
   ".svelte-kit",
   ".open-next",
   ".wrangler",
-  "voxium",
 ]);
+
+const NEVER_SOURCE_DIRS = new Set(["node_modules", ".git"]);
 
 /** True when a repo relative path is a source file Voxium should analyze. */
 export function isSourcePath(p: string): boolean {
   const parts = p.split("/");
-  for (let i = 0; i < parts.length - 1; i++) if (IGNORE_DIRS.has(parts[i])) return false;
+  for (let i = 0; i < parts.length - 1; i++) if (NEVER_SOURCE_DIRS.has(parts[i])) return false;
   const name = parts[parts.length - 1];
   if (name.endsWith(".d.ts")) return false;
   const dot = name.lastIndexOf(".");

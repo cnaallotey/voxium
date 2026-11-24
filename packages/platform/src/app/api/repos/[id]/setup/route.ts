@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { prepareSetup, wantFile } from "@/lib/analysis";
 import { currentUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
-import { createSetupPr, fetchTarball, getInstallationToken } from "@/lib/github";
+import { createSetupPr, fetchTarball, getBranchSha, getInstallationToken, listTreePaths } from "@/lib/github";
 import { readTarGz } from "@/lib/tar";
 import { audit, getOrg, getRepo, getRole, saveAnalysis, setRepoSetup } from "@/lib/store";
 
@@ -30,8 +30,14 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
 
   try {
     const token = await getInstallationToken({ appId: env.GITHUB_APP_ID, privateKey: env.GITHUB_APP_PRIVATE_KEY }, org.installation_id);
-    const files = await readTarGz(await fetchTarball(token, repo.full_name, repo.default_branch), { want: wantFile });
-    const plan = prepareSetup(files);
+    const sha = await getBranchSha(token, repo.full_name, repo.default_branch);
+    const treePaths = await listTreePaths(token, repo.full_name, sha);
+    if (!treePaths) return back(env, "/dashboard", `${repo.full_name} is too large to analyze completely.`);
+    const files = await readTarGz(await fetchTarball(token, repo.full_name, sha), { want: wantFile });
+    const plan = prepareSetup(files, treePaths);
+    if (plan.unchecked.length) {
+      return back(env, "/dashboard", `${repo.full_name} has ${plan.unchecked.length} source file(s) that cannot be analyzed (too large, symlinked or excluded from archives), for example ${plan.unchecked[0]}.`);
+    }
     if (Object.keys(plan.summary.modules).length === 0) {
       return back(env, "/dashboard", `Could not find any folders to treat as modules in ${repo.full_name}.`);
     }

@@ -1,13 +1,20 @@
 import {
+  ARCH_FILE_PATH,
+  BASELINE_FILE_PATH,
   buildGraphFromFiles,
   buildSetupFiles,
   checkArchitecture,
   failing,
+  findProtectedChanges,
   inferArchitecture,
   isSourcePath,
+  matchesAny,
+  parseBaseline,
+  tightenBaseline,
   validateArchitecture,
   type Architecture,
   type FileMap,
+  type ProtectedContents,
   type Violation,
 } from "@voxium/core";
 
@@ -31,12 +38,22 @@ export interface SetupPlan {
   summary: InferenceSummary;
   setupFiles: Record<string, string>;
   baselineCount: number;
+  /** Source files that could not be read, so the plan would not cover them. */
+  unchecked: string[];
+}
+
+/**
+ * Source paths in a commit that are missing from the files we read: too large, over the memory budget,
+ * symlinked, or left out of the tarball by .gitattributes. A check that skipped them proves nothing.
+ */
+export function uncheckedPaths(treePaths: string[], files: FileMap, ignore: string[] = []): string[] {
+  return treePaths.filter((p) => isSourcePath(p) && !Object.hasOwn(files, p) && !matchesAny(p, ignore));
 }
 
 /** Infer an architecture for a repo and prepare every file the setup PR will contain. */
-export function prepareSetup(files: FileMap): SetupPlan {
+export function prepareSetup(files: FileMap, treePaths?: string[]): SetupPlan {
   const graph = buildGraphFromFiles(files);
-  const inf = inferArchitecture(graph);
+  const inf = inferArchitecture(graph, { paths: treePaths?.filter(isSourcePath) });
   const result = checkArchitecture(inf.architecture, graph);
   const baseline = result.violations.filter((v) => v.severity === "block").map((v) => v.id);
   const setupFiles = buildSetupFiles({
@@ -47,6 +64,7 @@ export function prepareSetup(files: FileMap): SetupPlan {
   return {
     setupFiles,
     baselineCount: baseline.length,
+    unchecked: treePaths ? uncheckedPaths(treePaths, files, inf.architecture.ignore) : [],
     summary: {
       confidence: inf.confidence,
       layers: inf.architecture.layers,
@@ -64,62 +82,111 @@ export interface PrCheckOutcome {
   description: string;
   newViolations: Array<Pick<Violation, "ruleId" | "severity" | "file" | "message" | "fix">>;
   baselineCount: number;
-  architectureChanged: boolean;
+  /** Protected files this PR alters. */
+  protectedChanges: string[];
+  /** Team Leader who approved those changes at this exact commit. */
+  approvedBy: string | null;
+  /** Source files that could not be read (first few), and how many there are. */
+  unchecked: string[];
+  uncheckedCount: number;
 }
 
-function parseJson<T>(text: string | null): T | null {
+export interface PrCheckInput {
+  headFiles: FileMap;
+  /** Every path in the head commit, or null when GitHub could not list them all. */
+  treePaths: string[] | null;
+  /** Protected files at the tip of the base branch, where the PR branched off, and in the PR. */
+  base: ProtectedContents;
+  mergeBase: ProtectedContents;
+  head: ProtectedContents;
+  /** Team Leader who approved the protected changes at this exact commit, if any. */
+  approvedBy?: string | null;
+  today?: Date;
+}
+
+function parseArch(text: string | null | undefined): Architecture | null {
   if (!text) return null;
   try {
-    return JSON.parse(text) as T;
+    const arch = JSON.parse(text) as Architecture;
+    return validateArchitecture(arch).ok ? arch : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Check a pull request. Rules come from the BASE branch, so a PR cannot weaken the rules it is judged by.
- * If the PR edits the architecture files, that is reported and the base rules still apply.
+ * Check a pull request. Rules come from the base branch, so a PR cannot weaken the rules it is judged by.
+ * A PR that alters the protected files fails until a Team Leader approves that exact commit, and is then
+ * judged by the rules they approved. Anything we could not read is an error, never a pass.
  */
-export function checkPullRequest(
-  headFiles: FileMap,
-  baseArchitectureJson: string | null,
-  baseBaselineJson: string | null,
-  headArchitectureJson: string | null,
-  today?: Date,
-): PrCheckOutcome {
-  const empty = { newViolations: [], baselineCount: 0, architectureChanged: false };
-  if (!baseArchitectureJson) {
-    return { ...empty, state: "success", skipped: true, description: "Voxium is not set up on the base branch." };
+export function checkPullRequest(input: PrCheckInput): PrCheckOutcome {
+  const { base, head } = input;
+  const protectedChanges = findProtectedChanges(base, input.mergeBase, head);
+  const approvedBy = protectedChanges.length ? (input.approvedBy ?? null) : null;
+  const out: PrCheckOutcome = {
+    state: "success",
+    skipped: false,
+    description: "",
+    newViolations: [],
+    baselineCount: 0,
+    protectedChanges,
+    approvedBy,
+    unchecked: [],
+    uncheckedCount: 0,
+  };
+  if (!base[ARCH_FILE_PATH]) {
+    return { ...out, skipped: true, description: "Voxium is not set up on the base branch." };
   }
-  const arch = parseJson<Architecture>(baseArchitectureJson);
-  const valid = arch ? validateArchitecture(arch) : { ok: false, errors: ["not valid JSON"] };
-  if (!arch || !valid.ok) {
-    return { ...empty, state: "error", skipped: false, description: "voxium/architecture.json on the base branch is invalid." };
-  }
-  const baseline = parseJson<{ violations?: string[] }>(baseBaselineJson)?.violations ?? [];
-  const architectureChanged = headArchitectureJson !== null && headArchitectureJson !== baseArchitectureJson;
 
-  const result = checkArchitecture(arch, buildGraphFromFiles(headFiles), { baseline, today });
+  const names = protectedChanges.map((p) => p.split("/").pop()).join(", ");
+  const unapproved = protectedChanges.length > 0 && !approvedBy;
+  const note = unapproved ? `${names} changed: needs Team Leader approval. ` : approvedBy ? `${names} approved by ${approvedBy}. ` : "";
+
+  const archChanged = protectedChanges.includes(ARCH_FILE_PATH);
+  if (archChanged && approvedBy && !head[ARCH_FILE_PATH]) {
+    return { ...out, description: `${note}Voxium is removed by this PR.` };
+  }
+  // Even an approval cannot merge rules that would break every later check.
+  if (archChanged && head[ARCH_FILE_PATH] && !parseArch(head[ARCH_FILE_PATH])) {
+    return { ...out, state: "failure", description: `${note}The new voxium/architecture.json is invalid.` };
+  }
+  const arch = parseArch(archChanged && approvedBy ? head[ARCH_FILE_PATH] : base[ARCH_FILE_PATH]);
+  if (!arch) {
+    const why = `${note}voxium/architecture.json on the base branch is invalid.`;
+    return { ...out, state: "error", description: why };
+  }
+  const baseline =
+    protectedChanges.includes(BASELINE_FILE_PATH) && approvedBy
+      ? (parseBaseline(head[BASELINE_FILE_PATH]) ?? [])
+      : head[BASELINE_FILE_PATH] === input.mergeBase[BASELINE_FILE_PATH]
+        ? (parseBaseline(base[BASELINE_FILE_PATH]) ?? [])
+        : tightenBaseline(base[BASELINE_FILE_PATH], head[BASELINE_FILE_PATH]);
+
+  const result = checkArchitecture(arch, buildGraphFromFiles(input.headFiles), { baseline, today: input.today });
   const bad = failing(result);
   const expired = result.expiredExceptions.length;
-  const baselineCount = result.violations.filter((v) => v.baseline).length;
+  const unchecked = input.treePaths ? uncheckedPaths(input.treePaths, input.headFiles, arch.ignore) : [];
 
   const counts = new Map<string, number>();
   for (const v of bad) counts.set(v.ruleId, (counts.get(v.ruleId) ?? 0) + 1);
   const list = [...counts].map(([r, n]) => `${r} x${n}`).join(", ");
-  const note = architectureChanged ? " Architecture files changed: base rules applied, Team Leader review required." : "";
-
-  const failed = bad.length > 0 || expired > 0;
-  const description = failed
-    ? `${bad.length} new blocking violation(s)${list ? `: ${list}` : ""}${expired ? `, ${expired} expired exception(s)` : ""}.${note}`
-    : `No new violations.${note}`;
+  const gap = !input.treePaths
+    ? "The repository is too large to check completely."
+    : unchecked.length
+      ? `${unchecked.length} source file(s) could not be read, for example ${unchecked[0]}.`
+      : "";
+  const problems =
+    bad.length || expired
+      ? `${bad.length} new blocking violation(s)${list ? `: ${list}` : ""}${expired ? `, ${expired} expired exception(s)` : ""}.`
+      : "";
 
   return {
-    state: failed ? "failure" : "success",
-    skipped: false,
-    description,
+    ...out,
+    state: problems || unapproved ? "failure" : gap ? "error" : "success",
+    description: `${note}${[problems, gap].filter(Boolean).join(" ") || "No new violations."}`,
     newViolations: bad.map((v) => ({ ruleId: v.ruleId, severity: v.severity, file: v.file, message: v.message, fix: v.fix })),
-    baselineCount,
-    architectureChanged,
+    baselineCount: result.violations.filter((v) => v.baseline).length,
+    unchecked: unchecked.slice(0, 20),
+    uncheckedCount: unchecked.length,
   };
 }
