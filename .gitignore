@@ -1,0 +1,6 @@
+node_modules
+dist
+*.tsbuildinfo
+.DS_Store
+# GitHub App credentials written by convert-manifest.mjs when run from the repo root
+github-app/out/

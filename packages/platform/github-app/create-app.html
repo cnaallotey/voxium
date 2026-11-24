@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Create the Voxium GitHub App</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input { width: 100%; padding: 8px; font-size: 15px; box-sizing: border-box; }
+  button { margin-top: 18px; padding: 10px 16px; font-size: 15px; cursor: pointer; }
+  code { background: #eee; padding: 1px 5px; border-radius: 4px; }
+  .hint { color: #555; font-size: 13px; }
+</style>
+<h1>Create the Voxium GitHub App</h1>
+<p>Fills in the app manifest for you and sends it to GitHub. GitHub shows a confirmation page, then redirects to your Voxium site, which shows the one time code and the exact command to run.</p>
+
+<label for="url">Your deployed URL (no trailing slash)</label>
+<input id="url" value="https://voxium.example.workers.dev">
+<div class="hint">Must be reachable by GitHub for webhooks. For local testing use a tunnel URL.</div>
+
+<label for="name">App name</label>
+<input id="name" value="Voxium">
+<div class="hint">App names are unique on GitHub. Change it if "Voxium" is taken.</div>
+
+<label for="org">Organization login (leave empty for your personal account)</label>
+<input id="org" placeholder="my-org">
+
+<form id="f" method="post">
+  <input type="hidden" name="manifest" id="manifest">
+  <button type="submit">Create GitHub App</button>
+</form>
+
+<script>
+const template = {
+  name: "Voxium",
+  url: "{{APP_URL}}",
+  description: "Keeps developers and coding agents inside your architecture.",
+  public: false,
+  hook_attributes: { url: "{{APP_URL}}/api/github/webhook", active: true },
+  redirect_url: "{{APP_URL}}/setup/github-app",
+  callback_urls: ["{{APP_URL}}/api/auth/callback"],
+  setup_url: "{{APP_URL}}/dashboard",
+  default_permissions: { metadata: "read", contents: "write", pull_requests: "write", statuses: "write", workflows: "write" },
+  default_events: ["pull_request"],
+};
+document.getElementById("f").addEventListener("submit", (e) => {
+  const base = document.getElementById("url").value.trim().replace(/\/+$/, "");
+  const org = document.getElementById("org").value.trim();
+  const manifest = JSON.parse(JSON.stringify(template).replaceAll("{{APP_URL}}", base));
+  manifest.name = document.getElementById("name").value.trim() || "Voxium";
+  document.getElementById("manifest").value = JSON.stringify(manifest);
+  e.target.action = org
+    ? `https://github.com/organizations/${encodeURIComponent(org)}/settings/apps/new`
+    : "https://github.com/settings/apps/new";
+});
+</script>

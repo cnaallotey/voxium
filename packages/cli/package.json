@@ -1,0 +1,19 @@
+{
+  "name": "voxium",
+  "version": "0.0.1",
+  "type": "module",
+  "bin": {
+    "voxium": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@voxium/core": "0.0.1",
+    "zod": "^4.6.7"
+  }
+}

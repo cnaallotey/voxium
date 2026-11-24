@@ -1,0 +1,148 @@
+/**
+ * Streaming tar.gz reader. Memory stays bounded: only files the caller wants (and that are
+ * small enough) are kept, everything else is skipped as it streams past.
+ * Handles ustar prefixes, pax extended headers (what GitHub tarballs use) and GNU long names.
+ */
+
+class ByteReader {
+  private chunks: Uint8Array[] = [];
+  private len = 0;
+  private done = false;
+  constructor(private reader: ReadableStreamDefaultReader<Uint8Array>) {}
+
+  private async pull(): Promise<boolean> {
+    if (this.done) return false;
+    const { value, done } = await this.reader.read();
+    if (done) {
+      this.done = true;
+      return false;
+    }
+    if (value && value.length) {
+      this.chunks.push(value);
+      this.len += value.length;
+    }
+    return true;
+  }
+
+  async take(n: number): Promise<Uint8Array | null> {
+    while (this.len < n) if (!(await this.pull())) return null;
+    const out = new Uint8Array(n);
+    let off = 0;
+    while (off < n) {
+      const first = this.chunks[0];
+      const k = Math.min(n - off, first.length);
+      out.set(first.subarray(0, k), off);
+      off += k;
+      if (k === first.length) this.chunks.shift();
+      else this.chunks[0] = first.subarray(k);
+    }
+    this.len -= n;
+    return out;
+  }
+
+  async skip(n: number): Promise<void> {
+    while (n > 0) {
+      if (this.len === 0 && !(await this.pull())) return;
+      const first = this.chunks[0];
+      const k = Math.min(n, first.length);
+      if (k === first.length) this.chunks.shift();
+      else this.chunks[0] = first.subarray(k);
+      this.len -= k;
+      n -= k;
+    }
+  }
+}
+
+const dec = new TextDecoder();
+
+function str(b: Uint8Array, start: number, len: number): string {
+  const slice = b.subarray(start, start + len);
+  const nul = slice.indexOf(0);
+  return dec.decode(nul === -1 ? slice : slice.subarray(0, nul));
+}
+
+function octal(b: Uint8Array, start: number, len: number): number {
+  if (b[start] & 0x80) return Number.MAX_SAFE_INTEGER; // base 256 sizes are huge, skip them
+  const s = str(b, start, len).trim();
+  return s ? parseInt(s, 8) : 0;
+}
+
+function parsePax(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let i = 0;
+  while (i < text.length) {
+    const sp = text.indexOf(" ", i);
+    if (sp === -1) break;
+    const total = parseInt(text.slice(i, sp), 10);
+    if (!total) break;
+    const rec = text.slice(sp + 1, i + total - 1); // drop trailing newline
+    const eq = rec.indexOf("=");
+    if (eq !== -1) out[rec.slice(0, eq)] = rec.slice(eq + 1);
+    i += total;
+  }
+  return out;
+}
+
+export interface ReadTarOptions {
+  /** Path with the leading "<repo>-<sha>/" folder already removed. */
+  want: (path: string) => boolean;
+  maxFileBytes?: number;
+  maxKeptBytes?: number;
+}
+
+export async function readTarGz(
+  source: ReadableStream<Uint8Array>,
+  opts: ReadTarOptions,
+): Promise<Record<string, string>> {
+  const maxFile = opts.maxFileBytes ?? 1_000_000;
+  const maxKept = opts.maxKeptBytes ?? 40_000_000;
+  const reader = new ByteReader(source.pipeThrough(new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>).getReader());
+  const files: Record<string, string> = {};
+  let kept = 0;
+  let paxPath: string | undefined;
+  let gnuLong: string | undefined;
+
+  for (;;) {
+    const header = await reader.take(512);
+    if (!header) break;
+    if (header.every((b) => b === 0)) continue; // end of archive blocks
+
+    const type = String.fromCharCode(header[156] || 48);
+    let name = str(header, 0, 100);
+    if (str(header, 257, 5) === "ustar") {
+      const prefix = str(header, 345, 155);
+      if (prefix) name = `${prefix}/${name}`;
+    }
+    const size = octal(header, 124, 12);
+    const padded = Math.ceil(size / 512) * 512;
+
+    if (type === "x" || type === "L") {
+      const body = await reader.take(padded);
+      if (!body) break;
+      const text = dec.decode(body.subarray(0, size));
+      if (type === "x") paxPath = parsePax(text).path ?? paxPath;
+      else gnuLong = text.replace(/\0+$/, "");
+      continue;
+    }
+    if (type === "g" || type === "K") {
+      await reader.skip(padded);
+      continue;
+    }
+
+    const fullName = (paxPath ?? gnuLong ?? name).replace(/^\.\//, "");
+    paxPath = undefined;
+    gnuLong = undefined;
+
+    const isFile = type === "0" || type === "7";
+    const rel = fullName.split("/").slice(1).join("/"); // drop "<repo>-<sha>/"
+    if (isFile && rel && size <= maxFile && kept + size <= maxKept && opts.want(rel)) {
+      const body = await reader.take(padded);
+      if (!body) break;
+      files[rel] = dec.decode(body.subarray(0, size));
+      kept += size;
+    } else {
+      await reader.skip(padded);
+    }
+  }
+  return files;
+}
