@@ -5,69 +5,50 @@
  */
 
 export function blankCommentsAndTemplates(code: string): string {
-  let out = "";
-  let i = 0;
+  const parts: string[] = [];
   const n = code.length;
+  let kept = 0; // start of the run that is copied as it is
+  let i = 0;
+  // Blank from..to, keeping newlines so positions stay the same.
+  const blank = (from: number, to: number) => {
+    parts.push(code.slice(kept, from), code.slice(from, to).replace(/[^\n]/g, " "));
+    kept = to;
+  };
   while (i < n) {
     const c = code[i];
-    const d = code[i + 1];
-    if (c === "/" && d === "/") {
-      while (i < n && code[i] !== "\n") {
-        out += " ";
-        i++;
-      }
-    } else if (c === "/" && d === "*") {
-      out += "  ";
-      i += 2;
-      while (i < n && !(code[i] === "*" && code[i + 1] === "/")) {
-        out += code[i] === "\n" ? "\n" : " ";
-        i++;
-      }
-      if (i < n) {
-        out += "  ";
-        i += 2;
-      }
+    if (c === "/" && code[i + 1] === "/") {
+      const nl = code.indexOf("\n", i);
+      const end = nl === -1 ? n : nl;
+      blank(i, end);
+      i = end;
+    } else if (c === "/" && code[i + 1] === "*") {
+      const close = code.indexOf("*/", i + 2);
+      const end = close === -1 ? n : close + 2;
+      blank(i, end);
+      i = end;
     } else if (c === '"' || c === "'") {
-      out += c;
       i++;
-      while (i < n && code[i] !== c && code[i] !== "\n") {
-        if (code[i] === "\\") {
-          out += code[i];
-          i++;
-        }
-        if (i < n) out += code[i];
-        i++;
-      }
-      if (i < n) {
-        out += code[i];
-        i++;
-      }
+      while (i < n && code[i] !== c && code[i] !== "\n") i += code[i] === "\\" ? 2 : 1;
+      i++;
     } else if (c === "`") {
-      out += "`";
+      const start = ++i;
+      while (i < n && code[i] !== "`") i += code[i] === "\\" ? 2 : 1;
+      i = Math.min(i, n);
+      blank(start, i);
       i++;
-      while (i < n && code[i] !== "`") {
-        if (code[i] === "\\") {
-          out += " ";
-          i++;
-        }
-        if (i < n) out += code[i] === "\n" ? "\n" : " ";
-        i++;
-      }
-      if (i < n) {
-        out += "`";
-        i++;
-      }
     } else {
-      out += c;
       i++;
     }
   }
-  return out;
+  parts.push(code.slice(kept));
+  return parts.join("");
 }
 
 const PATTERNS = [
   // import x from "a", import { x } from "a", export * from "a", export type { X } from "a"
-  /\b(?:import|export)\b[^;'"`]*?\bfrom\s*["']([^"'\n]+)["']/g,
+  // Never reads past another import or export keyword: the last one before "from" is enough to match, and
+  // without that limit a file with many of them takes quadratic time.
+  /\b(?:import|export)\b(?:(?!\b(?:import|export)\b)[^;'"`])*?\bfrom\s*["']([^"'\n]+)["']/g,
   // import "a"
   /\bimport\s*["']([^"'\n]+)["']/g,
   // import("a")

@@ -6,7 +6,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { buildGraphFromFiles, IGNORE_DIRS, isSourcePath, type BuildGraphOptions, type FileMap } from "./graph.js";
+import { buildGraphFromFiles, expandSymlinks, IGNORE_DIRS, isSourcePath, type BuildGraphOptions, type FileMap } from "./graph.js";
 import { ARCH_FILE_PATH, BASELINE_FILE_PATH, PROTECTED_FILES, parseBaseline, type ProtectedContents } from "./protect.js";
 import { validateArchitecture } from "./schema.js";
 import type { Architecture, ProjectGraph } from "./types.js";
@@ -48,19 +48,46 @@ function gitPaths(root: string): string[] | null {
  */
 export function readProjectFiles(root: string): FileMap {
   const abs = path.resolve(root);
-  const acc: FileMap = {};
-  const tracked = gitPaths(abs);
-  if (!tracked) {
-    walk(abs, abs, acc);
-    return acc;
+  const files: FileMap = {};
+  const links: Record<string, string> = {};
+  collect(abs, abs, files, links);
+  return expandSymlinks(files, links);
+}
+
+function posixRelative(root: string, p: string): string {
+  return path.relative(root, p).split(path.sep).join("/");
+}
+
+function lstat(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch {
+    return null; // deleted in the work tree, or a parent is now a file
   }
-  for (const rel of tracked) {
-    if (!isSourcePath(rel)) continue;
-    const p = path.join(abs, rel);
-    const stat = fs.lstatSync(p, { throwIfNoEntry: false });
-    if (stat?.isFile()) acc[rel] = fs.readFileSync(p, "utf8");
+}
+
+function collect(root: string, dir: string, files: FileMap, links: Record<string, string>): void {
+  const listed = gitPaths(dir);
+  if (!listed) {
+    walk(root, dir, files);
+    return;
   }
-  return acc;
+  for (const entry of listed) {
+    const p = path.join(dir, entry);
+    const rel = posixRelative(root, p);
+    const stat = lstat(p);
+    if (stat?.isDirectory()) {
+      // Git lists a submodule or nested repo as one entry. Look inside, with its own git when it has one.
+      if (fs.existsSync(path.join(p, ".git"))) collect(root, p, files, links);
+      else walk(root, p, files);
+    } else if (stat?.isSymbolicLink()) {
+      const target = path.resolve(path.dirname(p), fs.readlinkSync(p));
+      const to = posixRelative(root, target);
+      if (to && !to.startsWith("..") && !path.isAbsolute(to)) links[rel] = to;
+    } else if (stat?.isFile() && isSourcePath(rel)) {
+      files[rel] = fs.readFileSync(p, "utf8");
+    }
+  }
 }
 
 /** Contents of the protected files at a git ref. Throws when the ref itself cannot be read. */

@@ -26,6 +26,7 @@ export const IGNORE_DIRS = new Set([
   ".svelte-kit",
   ".open-next",
   ".wrangler",
+  ".yarn",
 ]);
 
 const NEVER_SOURCE_DIRS = new Set(["node_modules", ".git"]);
@@ -38,6 +39,26 @@ export function isSourcePath(p: string): boolean {
   if (name.endsWith(".d.ts")) return false;
   const dot = name.lastIndexOf(".");
   return dot !== -1 && SOURCE_EXT.includes(name.slice(dot));
+}
+
+/**
+ * Make symlinks visible to the import graph. A link to a source file becomes a file that re-exports it, and a
+ * link to a folder becomes one such file per source file inside. Links are path to repo relative target.
+ */
+export function expandSymlinks(files: FileMap, links: Record<string, string>): FileMap {
+  const out: FileMap = { ...files };
+  const reexport = (from: string, to: string) => {
+    if (!isSourcePath(from) || Object.hasOwn(files, from)) return;
+    const up = "../".repeat(from.split("/").length - 1) || "./";
+    out[from] = `export * from ${JSON.stringify(up + to)};\n`;
+  };
+  for (const [link, first] of Object.entries(links)) {
+    let target = first;
+    for (let hops = 0; hops < 40 && Object.hasOwn(links, target); hops++) target = links[target]; // a link to a link
+    if (Object.hasOwn(files, target)) reexport(link, target);
+    else for (const f of Object.keys(files)) if (f.startsWith(`${target}/`)) reexport(link + f.slice(target.length), f);
+  }
+  return out;
 }
 
 function dirname(p: string): string {

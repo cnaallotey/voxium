@@ -2,8 +2,8 @@ import { NextResponse, type NextRequest } from "next/server";
 import { verifyWebhookSignature } from "@/lib/crypto";
 import { getEnv, waitUntil } from "@/lib/env";
 import { getInstallationToken, listInstallationRepos } from "@/lib/github";
-import { runPullRequestCheck } from "@/lib/repo-job";
-import { prEventFrom, type WebhookPayload } from "@/lib/webhook";
+import { runPullRequestCheck, updateSetupStatus } from "@/lib/repo-job";
+import { closedPrFrom, prEventFrom, type WebhookPayload } from "@/lib/webhook";
 import { deleteOrgByInstallation, getOrgByInstallation, removeRepos, upsertOrg, upsertRepos } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
@@ -27,6 +27,7 @@ export async function POST(req: NextRequest) {
     } else if (body.action === "created" && body.installation?.account) {
       const org = await upsertOrg(env.DB, {
         installation_id: installationId,
+        account_id: body.installation.account.id,
         account_login: body.installation.account.login,
         account_type: body.installation.account.type,
       });
@@ -47,6 +48,12 @@ export async function POST(req: NextRequest) {
   const prEvent = prEventFrom(event, body);
   if (prEvent) {
     waitUntil(runPullRequestCheck(prEvent));
+    return NextResponse.json({ ok: true, queued: true }, { status: 202 });
+  }
+
+  const closed = closedPrFrom(event, body);
+  if (closed) {
+    waitUntil(updateSetupStatus(closed));
     return NextResponse.json({ ok: true, queued: true }, { status: 202 });
   }
 

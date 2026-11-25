@@ -6,7 +6,10 @@ import {
   failing,
   inferArchitecture,
   buildSetupFiles,
+  cliPackageInWorkflow,
   findProtectedChanges,
+  parseCliPackage,
+  WORKFLOW_FILE_PATH,
   tightenBaseline,
 } from "@voxium/core";
 import {
@@ -31,10 +34,10 @@ Usage: voxium <command> [options]
 
 Commands:
   init       Infer an architecture, write voxium/architecture.json, a baseline,
-             agent rules (CLAUDE.md, AGENTS.md) and the CI workflow.
+             and agent rules (CLAUDE.md, AGENTS.md).
   infer      Print the inferred architecture without writing anything.
   check      Check the code against voxium/architecture.json. Exits 1 on blocking violations.
-  generate   Regenerate agent rules and the CI workflow from voxium/architecture.json.
+  generate   Regenerate agent rules from voxium/architecture.json.
   mcp        Run the MCP server over stdio so coding agents can check rules and changes.
 
 Options:
@@ -43,6 +46,9 @@ Options:
   --rules-from <ref>  check: take the rules and baseline from a git ref, such as origin/main,
                       so a change is not judged by its own edits to them
   --update-baseline   check: accept all current violations as baseline debt
+  --cli-package <p>   init, generate: also write the CI workflow and .mcp.json, running this exact
+                      published version, such as voxium@1.2.3 (or set VOXIUM_CLI_PACKAGE).
+                      generate keeps the version the workflow already pins.
   --force             init: overwrite an existing architecture file
   -h, --help          Show this help
 `;
@@ -53,6 +59,7 @@ interface Args {
   format: "text" | "json" | "github";
   updateBaseline: boolean;
   rulesFrom?: string;
+  cliPackage?: string;
   force: boolean;
   help: boolean;
 }
@@ -71,6 +78,10 @@ function parseArgs(argv: string[]): Args {
       const ref = argv[++i];
       if (!ref) throw new Error("--rules-from needs a git ref.");
       args.rulesFrom = ref;
+    } else if (a === "--cli-package") {
+      const spec = parseCliPackage(argv[++i]);
+      if (!spec) throw new Error("--cli-package needs an exact version, such as voxium@1.2.3.");
+      args.cliPackage = spec;
     } else if (a === "--update-baseline") args.updateBaseline = true;
     else if (a === "--force") args.force = true;
     else if (!args.cmd && !a.startsWith("-")) args.cmd = a;
@@ -79,10 +90,19 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function writeSetupFiles(root: string, arch: Architecture, baseline: string[], only?: (p: string) => boolean): string[] {
+function writeSetupFiles(
+  root: string,
+  arch: Architecture,
+  baseline: string[],
+  opts: { cliPackage?: string; only?: (p: string) => boolean } = {},
+): string[] {
+  const { only } = opts;
+  const workflow = readIfExists(root, WORKFLOW_FILE_PATH);
+  const cliPackage = opts.cliPackage ?? parseCliPackage(process.env.VOXIUM_CLI_PACKAGE) ?? cliPackageInWorkflow(workflow);
   const files = buildSetupFiles({
     arch,
     baseline,
+    cliPackage,
     existing: {
       "CLAUDE.md": readIfExists(root, "CLAUDE.md"),
       "AGENTS.md": readIfExists(root, "AGENTS.md"),
@@ -94,6 +114,12 @@ function writeSetupFiles(root: string, arch: Architecture, baseline: string[], o
     if (only && !only(p)) continue;
     writeText(root, p, content);
     written.push(p);
+  }
+  if (!cliPackage) {
+    console.log("Note: no CI workflow or .mcp.json entry was written. Pass --cli-package with a published version to add them.");
+    if (workflow && /npx .*\bvoxium\b/.test(workflow)) {
+      console.log(`Note: ${WORKFLOW_FILE_PATH} runs "voxium" from npm without an exact version. Pin it or delete the file.`);
+    }
   }
   return written;
 }
@@ -217,7 +243,7 @@ function main(): number {
       const arch = res.architecture;
       const result = checkArchitecture(arch, graph);
       const baselineIds = result.violations.filter((v) => v.severity === "block").map((v) => v.id);
-      const written = writeSetupFiles(root, arch, baselineIds);
+      const written = writeSetupFiles(root, arch, baselineIds, { cliPackage: args.cliPackage });
       console.log(`Voxium set up. Confidence in the inferred layers: ${(res.confidence * 100).toFixed(0)}%.`);
       console.log(`\nLayers, top to bottom:\n  ${arch.layers.join("\n  ")}`);
       console.log(`\nWritten: ${written.join(", ")}`);
@@ -228,7 +254,10 @@ function main(): number {
 
     case "generate": {
       const arch = loadArchitecture(root);
-      const written = writeSetupFiles(root, arch, loadBaseline(root), (p) => p !== ARCH_FILE && p !== BASELINE_FILE);
+      const written = writeSetupFiles(root, arch, loadBaseline(root), {
+        cliPackage: args.cliPackage,
+        only: (p) => p !== ARCH_FILE && p !== BASELINE_FILE,
+      });
       console.log(`Regenerated: ${written.join(", ")}`);
       return 0;
     }

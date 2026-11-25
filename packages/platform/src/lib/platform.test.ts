@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { extractImports } from "@voxium/core";
 import { checkPullRequest, prepareSetup, wantFile, type PrCheckInput } from "./analysis";
 import { hmacSha256Hex, safeEqual, verifyWebhookSignature } from "./crypto";
 import { createAppJwt, createSetupPr, pkcs1ToPkcs8 } from "./github";
@@ -108,6 +109,50 @@ describe("tar paths", () => {
   });
 });
 
+describe("archives that differ from the commit", () => {
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=t", ...args], { cwd });
+
+  /** Commit these files, archive them as GitHub does, and read the archive against the commit's own hashes. */
+  async function archived(files: Record<string, string>) {
+    const dir = tmp();
+    for (const [f, c] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+      fs.writeFileSync(path.join(dir, f), c);
+    }
+    git(dir, "init", "-q");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "x");
+    const tree = new Map(
+      git(dir, "ls-tree", "-r", "HEAD").toString().trim().split("\n").map((l) => [l.split("\t")[1], l.split(/\s/)[2]] as const),
+    );
+    const out = path.join(tmp(), "a.tar.gz");
+    git(dir, "archive", "--format=tar.gz", "--prefix=o-r-sha/", "-o", out, "HEAD");
+    const want = (p: string) => p.endsWith(".ts");
+    return { unverified: await readTarGz(stream(out), { want }), files: await readTarGz(stream(out), { want, expect: tree }) };
+  }
+
+  it("drops a file that export-subst rewrote to hide an import", async () => {
+    const { unverified, files } = await archived({
+      ".gitattributes": "*.ts export-subst\n",
+      "src/d.ts": `const s = '$Format:%x27;/*$'; import "../ui/Page";\n`,
+      "src/ok.ts": "export {};\n",
+    });
+    expect(extractImports(unverified["src/d.ts"])).toEqual([]); // the attack works on the raw archive
+    expect(Object.keys(files)).toEqual(["src/ok.ts"]);
+  });
+
+  it("drops a file that was re-encoded", async () => {
+    const { files } = await archived({ ".gitattributes": "src/d.ts working-tree-encoding=UTF-16LE\n", "src/ok.ts": "export {};\n", "src/d.ts": "a\u0000\n\u0000" });
+    expect(Object.keys(files)).toEqual(["src/ok.ts"]);
+  });
+
+  it("restores line endings the archive converted", async () => {
+    const { unverified, files } = await archived({ ".gitattributes": "*.ts text eol=crlf\n", "src/ok.ts": "a\nb\n" });
+    expect(unverified["src/ok.ts"]).toBe("a\r\nb\r\n");
+    expect(files["src/ok.ts"]).toBe("a\nb\n");
+  });
+});
+
 describe("webhook signature", () => {
   it("accepts a correct signature and rejects wrong, missing or malformed ones", async () => {
     const body = JSON.stringify({ hello: "world" });
@@ -197,8 +242,11 @@ describe("analysis", () => {
     const plan = prepareSetup({ ...goodFiles, "CLAUDE.md": "# Mine\n" });
     expect(plan.summary.layers).toEqual(["ui", "services", "data"]);
     expect(Object.keys(plan.setupFiles).sort()).toEqual(
-      [".github/workflows/voxium.yml", ".mcp.json", "AGENTS.md", "CLAUDE.md", "voxium/CODEOWNERS.suggested", "voxium/architecture.json", "voxium/baseline.json"].sort(),
+      ["AGENTS.md", "CLAUDE.md", "voxium/CODEOWNERS.suggested", "voxium/architecture.json", "voxium/baseline.json"].sort(),
     );
+    const pinned = prepareSetup(goodFiles, undefined, "voxium@1.2.3").setupFiles;
+    expect(pinned[".github/workflows/voxium.yml"]).toContain("voxium@1.2.3 check");
+    expect(pinned[".mcp.json"]).toContain("voxium@1.2.3");
     expect(plan.setupFiles["CLAUDE.md"]).toContain("# Mine");
     expect(check(goodFiles, rulesFor(goodFiles)).state).toBe("success");
   });
@@ -283,6 +331,22 @@ describe("protected files", () => {
     expect(check(goodFiles, { ...rules, [ARCH]: ex("2026-01-01") }, renewed).state).toBe("success");
   });
 
+  it("does not accept an approval when the base rules changed since the PR branched", () => {
+    const newer = JSON.stringify({ ...JSON.parse(rules[ARCH]), ignore: ["x/**"] }); // anything the PR has not seen
+    for (const headRules of [{ [ARCH]: weak }, { [ARCH]: null }]) {
+      const res = checkPullRequest({
+        headFiles: bad,
+        treePaths: Object.keys(bad),
+        base: { ...rules, [ARCH]: newer },
+        mergeBase: rules,
+        head: { ...rules, ...headRules },
+        approvedBy: "lead",
+      });
+      expect(res.state).toBe("failure");
+      expect(res.description).toMatch(/Update the branch/);
+    }
+  });
+
   it("does not blame a branch that is merely behind", () => {
     const res = checkPullRequest({
       headFiles: goodFiles,
@@ -322,10 +386,36 @@ describe("complete checks", () => {
     expect(res.state).toBe("success");
   });
 
-  it("setup reports files it could not read and proposes ignoring committed build output", () => {
-    const plan = prepareSetup(goodFiles, [...Object.keys(goodFiles), "dist/bundle.js", "src/ui/huge.ts"]);
-    expect(JSON.parse(plan.setupFiles[ARCH]).ignore).toEqual(["dist/**"]);
-    expect(plan.unchecked).toEqual(["src/ui/huge.ts"]);
+  it("does not accept an ignored, unread file once checked code leads to it", () => {
+    const arch = JSON.stringify({ ...JSON.parse(rules[ARCH]), ignore: ["dist/**"] });
+    const files = { ...goodFiles, "src/data/d.ts": `import "../../dist/small";`, "dist/small.js": `import "./big";` };
+    const res = check(files, { ...rules, [ARCH]: arch }, { treePaths: [...Object.keys(files), "dist/big.js"] });
+    expect(res).toMatchObject({ state: "error", unchecked: ["dist/big.js"] });
+    // Output chunks that only import each other are fine.
+    const own = { ...goodFiles, "dist/small.js": `import "./big";` };
+    expect(check(own, { ...rules, [ARCH]: arch }, { treePaths: [...Object.keys(own), "dist/big.js"] }).state).toBe("success");
+  });
+
+  it("does not let an ignored folder carry an import around the layers", () => {
+    const arch = JSON.stringify({ ...JSON.parse(rules[ARCH]), ignore: ["dist/**"] });
+    const files = { ...goodFiles, "src/data/d.ts": `import "../../dist/bridge";`, "dist/bridge.js": `export * from "../src/ui/Page";` };
+    const res = check(files, { ...rules, [ARCH]: arch });
+    expect(res.state).toBe("failure");
+    expect(res.newViolations.map((v) => v.ruleId)).toContain("LAYER01");
+  });
+
+  it("setup proposes ignoring unreadable files that nothing imports, and refuses ones that are imported", () => {
+    const paths = [...Object.keys(goodFiles), "dist/bundle.js", "public/huge.js", ".yarn/releases/yarn.cjs", ".pnp.cjs"];
+    const plan = prepareSetup(goodFiles, paths);
+    expect(JSON.parse(plan.setupFiles[ARCH]).ignore).toEqual([".pnp.cjs", ".yarn/**", "dist/**", "public/huge.js"]);
+    expect(plan.unchecked).toEqual([]);
+    // The proposal then passes its own check.
+    expect(check(goodFiles, { [ARCH]: plan.setupFiles[ARCH], [BASELINE]: plan.setupFiles[BASELINE] }, { treePaths: paths }).state).toBe("success");
+
+    const imported = { ...goodFiles, "src/ui/Page.ts": `import "../gen/types";` };
+    expect(prepareSetup(imported, [...Object.keys(imported), "src/gen/types.ts"]).unchecked).toEqual(["src/gen/types.ts"]);
+    const many = Array.from({ length: 21 }, (_, i) => `vendor/${i}.js`);
+    expect(prepareSetup(goodFiles, [...Object.keys(goodFiles), ...many]).unchecked).toHaveLength(21);
   });
 });
 
@@ -347,6 +437,7 @@ describe("setup pull request", () => {
         if (url.endsWith("/git/commits")) return json({ sha: "commit1" });
         if (url.endsWith("/git/refs") && method === "POST") return json({}, opts.branchExists ? 422 : 201);
         if (url.includes("/git/refs/heads/voxium/setup") && method === "PATCH") return json({});
+        if (url.endsWith("/pulls/9") && method === "PATCH") return json({});
         if (url.includes("/pulls?state=open")) return json(opts.prExists ? [{ html_url: "https://gh/pr/9", number: 9 }] : []);
         if (url.endsWith("/pulls") && method === "POST") return json({ html_url: "https://gh/pr/10", number: 10 }, 201);
         return json({ message: `unexpected ${method} ${url}` }, 500);
@@ -371,6 +462,7 @@ describe("setup pull request", () => {
     const calls = fakeGithub({ branchExists: true, prExists: true });
     const res = await createSetupPr("tok", "o/r", "main", { a: "b" }, { title: "T", body: "B" });
     expect(res).toMatchObject({ number: 9, reused: true });
+    expect(calls.find((c) => c.url.endsWith("/pulls/9"))!.body).toEqual({ title: "T", body: "B" });
     expect(calls.some((c) => c.method === "PATCH" && c.url.includes("heads/voxium/setup") && c.body.force === true)).toBe(true);
     expect(calls.some((c) => c.url.endsWith("/pulls") && c.method === "POST")).toBe(false);
   });

@@ -64,7 +64,7 @@ export async function gh(token: string, path: string, init: RequestInit = {}): P
   });
 }
 
-async function ok<T>(res: Response, what: string): Promise<T> {
+export async function ok<T>(res: Response, what: string): Promise<T> {
   if (!res.ok) throw new Error(`GitHub ${what} failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
   return (await res.json()) as T;
 }
@@ -92,6 +92,45 @@ export async function listInstallationRepos(token: string): Promise<GhRepo[]> {
     );
     out.push(...data.repositories);
     if (data.repositories.length < 100) break;
+  }
+  return out;
+}
+
+export interface GhInstallation {
+  id: number;
+  app_id: number;
+  suspended_at: string | null;
+  account: { id: number; login: string; type: string };
+}
+
+/** Every installation the signed in user can reach. Throws rather than returning part of the list. */
+export async function listUserInstallations(userToken: string): Promise<GhInstallation[]> {
+  const out: GhInstallation[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const { installations } = await ok<{ installations: GhInstallation[] }>(
+      await gh(userToken, `/user/installations?per_page=100&page=${page}`),
+      "list installations",
+    );
+    out.push(...installations);
+    if (installations.length < 100) return out;
+  }
+  throw new Error("GitHub list installations failed: too many to read");
+}
+
+export interface GhUserRepo extends GhRepo {
+  permissions?: { admin?: boolean; maintain?: boolean; push?: boolean; pull?: boolean };
+}
+
+/** Repos of an installation that the signed in user can open. Stops at 3000, which only ever shows less. */
+export async function listUserRepos(userToken: string, installationId: number): Promise<GhUserRepo[]> {
+  const out: GhUserRepo[] = [];
+  for (let page = 1; page <= 30; page++) {
+    const { repositories } = await ok<{ repositories: GhUserRepo[] }>(
+      await gh(userToken, `/user/installations/${installationId}/repositories?per_page=100&page=${page}`),
+      "list user repositories",
+    );
+    out.push(...repositories);
+    if (repositories.length < 100) break;
   }
   return out;
 }
@@ -129,15 +168,15 @@ export async function getMergeBase(token: string, fullName: string, baseSha: str
 }
 
 /**
- * Every file path in a commit, or null when GitHub cannot list them all. The tarball alone is not proof of
- * what a commit holds: .gitattributes "export-ignore" removes files from it.
+ * Every file in a commit with its git blob hash, or null when GitHub cannot list them all. The tarball alone
+ * is not proof of what a commit holds: .gitattributes can remove files from it or change their contents.
  */
-export async function listTreePaths(token: string, fullName: string, sha: string): Promise<string[] | null> {
-  const data = await ok<{ truncated: boolean; tree: Array<{ path: string; type: string }> }>(
+export async function listTree(token: string, fullName: string, sha: string): Promise<Map<string, string> | null> {
+  const data = await ok<{ truncated: boolean; tree: Array<{ path: string; type: string; sha: string }> }>(
     await gh(token, `/repos/${fullName}/git/trees/${sha}?recursive=1`),
     "list files",
   );
-  return data.truncated ? null : data.tree.filter((t) => t.type === "blob").map((t) => t.path);
+  return data.truncated ? null : new Map(data.tree.filter((t) => t.type === "blob").map((t) => [t.path, t.sha]));
 }
 
 export interface GhReview {
@@ -158,14 +197,6 @@ export async function listReviews(token: string, fullName: string, number: numbe
     if (data.length < 100) return out;
   }
   throw new Error("GitHub list reviews failed: too many reviews to read");
-}
-
-/** True when the user can push to the repo. */
-export async function canWrite(token: string, fullName: string, login: string): Promise<boolean> {
-  const res = await gh(token, `/repos/${fullName}/collaborators/${encodeURIComponent(login)}/permission`);
-  if (res.status === 404) return false;
-  const { permission } = await ok<{ permission: string }>(res, "read permission");
-  return permission === "admin" || permission === "write";
 }
 
 export async function setCommitStatus(
@@ -253,7 +284,17 @@ export async function createSetupPr(
     await gh(token, `/repos/${fullName}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`),
     "find existing pull request",
   );
-  if (existing.length) return { url: existing[0].html_url, number: existing[0].number, branch, reused: true };
+  if (existing.length) {
+    // Its files were just replaced, so what it says about them has to be as well.
+    await ok(
+      await gh(token, `/repos/${fullName}/pulls/${existing[0].number}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: pr.title, body: pr.body }),
+      }),
+      "update pull request",
+    );
+    return { url: existing[0].html_url, number: existing[0].number, branch, reused: true };
+  }
 
   const created = await ok<{ html_url: string; number: number }>(
     await gh(token, `/repos/${fullName}/pulls`, {

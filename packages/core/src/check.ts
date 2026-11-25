@@ -9,10 +9,16 @@ import type {
   Violation,
 } from "./types.js";
 
+/**
+ * Which module each file belongs to. Ignored files belong to none, so they are not judged themselves, but
+ * like any other file outside the modules they are followed when something imports them.
+ */
 export function assignModules(arch: Architecture, files: string[]): Map<string, string> {
   const map = new Map<string, string>();
   const entries = Object.entries(arch.modules);
+  const ignore = arch.ignore ?? [];
   for (const file of files) {
+    if (matchesAny(file, ignore)) continue;
     for (const [name, def] of entries) {
       if (matchesAny(file, def.paths)) {
         map.set(file, name);
@@ -21,15 +27,6 @@ export function assignModules(arch: Architecture, files: string[]): Map<string, 
     }
   }
   return map;
-}
-
-/** Drop files the architecture explicitly ignores, and every import from or to them. */
-export function withoutIgnored(graph: ProjectGraph, ignore: string[] | undefined): ProjectGraph {
-  if (!ignore?.length) return graph;
-  const files = graph.files.filter((f) => !matchesAny(f, ignore));
-  if (files.length === graph.files.length) return graph;
-  const keep = new Set(files);
-  return { ...graph, files, edges: graph.edges.filter((e) => keep.has(e.from) && (!e.to || keep.has(e.to))) };
 }
 
 export interface Dependency {
@@ -166,10 +163,9 @@ export interface CheckOptions {
 
 export function checkArchitecture(
   arch: Architecture,
-  input: ProjectGraph,
+  graph: ProjectGraph,
   opts: CheckOptions = {},
 ): CheckResult {
-  const graph = withoutIgnored(input, arch.ignore);
   const modOf = assignModules(arch, graph.files);
   const violations: Violation[] = [];
   const layerIndex = new Map(arch.layers.map((m, i) => [m, i]));

@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getEnv } from "@/lib/env";
 import { createSessionToken, SESSION_COOKIE, sessionMaxAge } from "@/lib/session";
-import { gh, getInstallationToken, listInstallationRepos } from "@/lib/github";
-import { audit, ensureMembership, upsertOrg, upsertRepos, upsertUser } from "@/lib/store";
+import { gh, ok } from "@/lib/github";
+import { syncAccess } from "@/lib/sign-in";
+import { upsertUser, type UserRow } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 
@@ -12,12 +13,6 @@ interface GhUser {
   name: string | null;
   avatar_url: string | null;
 }
-interface GhInstallation {
-  id: number;
-  app_id: number;
-  account: { login: string; type: string };
-}
-
 export async function GET(req: NextRequest) {
   const env = getEnv();
   const code = req.nextUrl.searchParams.get("code");
@@ -41,33 +36,14 @@ export async function GET(req: NextRequest) {
   if (!tokenJson.access_token) return NextResponse.redirect(`${env.APP_URL}/?error=oauth_failed`);
   const userToken = tokenJson.access_token;
 
-  const ghUser = (await (await gh(userToken, "/user")).json()) as GhUser;
-  const user = await upsertUser(env.DB, {
-    github_id: ghUser.id,
-    login: ghUser.login,
-    name: ghUser.name,
-    avatar_url: ghUser.avatar_url,
-  });
-
-  // Link the user to every installation of this app they can access.
-  const instRes = await gh(userToken, "/user/installations?per_page=100");
-  if (instRes.ok) {
-    const { installations } = (await instRes.json()) as { installations: GhInstallation[] };
-    for (const inst of installations.filter((i) => String(i.app_id) === String(env.GITHUB_APP_ID))) {
-      const org = await upsertOrg(env.DB, {
-        installation_id: inst.id,
-        account_login: inst.account.login,
-        account_type: inst.account.type,
-      });
-      const role = await ensureMembership(env.DB, user.id, org.id);
-      await audit(env.DB, org.id, user.id, "sign_in", role);
-      try {
-        const token = await getInstallationToken({ appId: env.GITHUB_APP_ID, privateKey: env.GITHUB_APP_PRIVATE_KEY }, inst.id);
-        await upsertRepos(env.DB, org.id, await listInstallationRepos(token));
-      } catch (err) {
-        console.error("repo sync failed", inst.id, err);
-      }
-    }
+  let user: UserRow;
+  try {
+    const ghUser = await ok<GhUser>(await gh(userToken, "/user"), "read user");
+    user = await upsertUser(env.DB, { github_id: ghUser.id, login: ghUser.login, name: ghUser.name, avatar_url: ghUser.avatar_url });
+    await syncAccess(env, user, userToken);
+  } catch (err) {
+    console.error("sign in failed", err);
+    return NextResponse.redirect(`${env.APP_URL}/?error=github_unavailable`);
   }
 
   const res = NextResponse.redirect(`${env.APP_URL}/dashboard`);

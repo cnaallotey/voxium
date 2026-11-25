@@ -14,11 +14,13 @@ import {
   validateArchitecture,
   type Architecture,
   type FileMap,
+  type ProjectGraph,
   type ProtectedContents,
   type Violation,
 } from "@voxium/core";
 
-const EXTRA_FILES = new Set(["CLAUDE.md", "AGENTS.md", ".mcp.json"]);
+/** Agent files that setup extends rather than replaces. */
+export const EXTRA_FILES = new Set(["CLAUDE.md", "AGENTS.md", ".mcp.json"]);
 
 /** Which files from a repo tarball we keep in memory. Everything else streams past. */
 export function wantFile(path: string): boolean {
@@ -38,33 +40,71 @@ export interface SetupPlan {
   summary: InferenceSummary;
   setupFiles: Record<string, string>;
   baselineCount: number;
-  /** Source files that could not be read, so the plan would not cover them. */
+  /** Globs the plan proposes to leave out of the checks. */
+  ignore: string[];
+  /** Source files that could not be read and that the plan cannot leave out. */
   unchecked: string[];
 }
 
+/** Setup proposes ignoring at most this many unreadable files one by one. Beyond that a person should look. */
+const MAX_UNREAD_PROPOSALS = 20;
+
 /**
  * Source paths in a commit that are missing from the files we read: too large, over the memory budget,
- * symlinked, or left out of the tarball by .gitattributes. A check that skipped them proves nothing.
+ * symlinked, or not in the tarball as committed. A check that skipped them proves nothing.
  */
-export function uncheckedPaths(treePaths: string[], files: FileMap, ignore: string[] = []): string[] {
-  return treePaths.filter((p) => isSourcePath(p) && !Object.hasOwn(files, p) && !matchesAny(p, ignore));
+function unreadPaths(treePaths: string[], files: FileMap): string[] {
+  return treePaths.filter((p) => isSourcePath(p) && !Object.hasOwn(files, p));
+}
+
+/** The graph with unread files as empty nodes, so imports of them are seen even though their contents are not. */
+function graphWithUnread(files: FileMap, unread: string[]): ProjectGraph {
+  return buildGraphFromFiles(unread.length ? { ...files, ...Object.fromEntries(unread.map((p) => [p, ""])) } : files);
+}
+
+/**
+ * Unread files that matter. An ignored one is fine only while nothing that is checked leads to it, because
+ * otherwise it could carry any import out of sight.
+ */
+function uncheckedPaths(graph: ProjectGraph, unread: string[], ignore: string[] = []): string[] {
+  if (!unread.length) return [];
+  const missing = new Set(unread);
+  const next = new Map<string, string[]>();
+  for (const e of graph.edges) if (e.to) next.set(e.from, [...(next.get(e.from) ?? []), e.to]);
+  const queue = graph.files.filter((f) => !missing.has(f) && !matchesAny(f, ignore));
+  const reached = new Set(queue);
+  for (let i = 0; i < queue.length; i++) {
+    for (const to of next.get(queue[i]) ?? []) {
+      if (!reached.has(to)) {
+        reached.add(to);
+        queue.push(to);
+      }
+    }
+  }
+  return unread.filter((p) => reached.has(p) || !matchesAny(p, ignore));
 }
 
 /** Infer an architecture for a repo and prepare every file the setup PR will contain. */
-export function prepareSetup(files: FileMap, treePaths?: string[]): SetupPlan {
-  const graph = buildGraphFromFiles(files);
-  const inf = inferArchitecture(graph, { paths: treePaths?.filter(isSourcePath) });
+export function prepareSetup(files: FileMap, treePaths?: string[], cliPackage?: string): SetupPlan {
+  const unread = treePaths ? unreadPaths(treePaths, files) : [];
+  const graph = graphWithUnread(files, unread);
+  const inf = inferArchitecture(graph, { unread });
+  const ignore = inf.architecture.ignore ?? [];
+  const proposed = unread.filter((p) => ignore.includes(p));
+  const unchecked = proposed.length > MAX_UNREAD_PROPOSALS ? proposed : uncheckedPaths(graph, unread, ignore);
   const result = checkArchitecture(inf.architecture, graph);
   const baseline = result.violations.filter((v) => v.severity === "block").map((v) => v.id);
   const setupFiles = buildSetupFiles({
     arch: inf.architecture,
     baseline,
     existing: { "CLAUDE.md": files["CLAUDE.md"], "AGENTS.md": files["AGENTS.md"], ".mcp.json": files[".mcp.json"] },
+    cliPackage,
   });
   return {
     setupFiles,
     baselineCount: baseline.length,
-    unchecked: treePaths ? uncheckedPaths(treePaths, files, inf.architecture.ignore) : [],
+    ignore,
+    unchecked,
     summary: {
       confidence: inf.confidence,
       layers: inf.architecture.layers,
@@ -143,6 +183,13 @@ export function checkPullRequest(input: PrCheckInput): PrCheckOutcome {
   const note = unapproved ? `${names} changed: needs Team Leader approval. ` : approvedBy ? `${names} approved by ${approvedBy}. ` : "";
 
   const archChanged = protectedChanges.includes(ARCH_FILE_PATH);
+  // Git would merge these edits with newer ones on the base branch that nobody checked or approved together.
+  const stale = [ARCH_FILE_PATH, BASELINE_FILE_PATH].some(
+    (p) => protectedChanges.includes(p) && (base[p] ?? null) !== (input.mergeBase[p] ?? null),
+  );
+  if (stale && approvedBy) {
+    return { ...out, state: "failure", description: `The rules changed on the base branch since this PR branched. Update the branch, then approve again.` };
+  }
   if (archChanged && approvedBy && !head[ARCH_FILE_PATH]) {
     return { ...out, description: `${note}Voxium is removed by this PR.` };
   }
@@ -162,10 +209,12 @@ export function checkPullRequest(input: PrCheckInput): PrCheckOutcome {
         ? (parseBaseline(base[BASELINE_FILE_PATH]) ?? [])
         : tightenBaseline(base[BASELINE_FILE_PATH], head[BASELINE_FILE_PATH]);
 
-  const result = checkArchitecture(arch, buildGraphFromFiles(input.headFiles), { baseline, today: input.today });
+  const unread = input.treePaths ? unreadPaths(input.treePaths, input.headFiles) : [];
+  const graph = graphWithUnread(input.headFiles, unread);
+  const result = checkArchitecture(arch, graph, { baseline, today: input.today });
   const bad = failing(result);
   const expired = result.expiredExceptions.length;
-  const unchecked = input.treePaths ? uncheckedPaths(input.treePaths, input.headFiles, arch.ignore) : [];
+  const unchecked = uncheckedPaths(graph, unread, arch.ignore);
 
   const counts = new Map<string, number>();
   for (const v of bad) counts.set(v.ruleId, (counts.get(v.ruleId) ?? 0) + 1);

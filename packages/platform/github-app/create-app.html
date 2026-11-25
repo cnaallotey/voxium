@@ -12,9 +12,13 @@
 <h1>Create the Voxium GitHub App</h1>
 <p>Fills in the app manifest for you and sends it to GitHub. GitHub shows a confirmation page, then redirects to your Voxium site, which shows the one time code and the exact command to run.</p>
 
-<label for="url">Your deployed URL (no trailing slash)</label>
+<label for="url">Your Voxium URL (no trailing slash)</label>
 <input id="url" value="https://voxium.example.workers.dev">
-<div class="hint">Must be reachable by GitHub for webhooks. For local testing use a tunnel URL.</div>
+<div class="hint">Where you open Voxium in your browser. For local testing use http://localhost:3000.</div>
+
+<label for="webhook">Webhook URL (leave empty to use the URL above)</label>
+<input id="webhook" placeholder="https://something.trycloudflare.com">
+<div class="hint">GitHub must be able to reach it. For local testing put the tunnel URL here.</div>
 
 <label for="name">App name</label>
 <input id="name" value="Voxium">
@@ -23,6 +27,7 @@
 <label for="org">Organization login (leave empty for your personal account)</label>
 <input id="org" placeholder="my-org">
 
+<p id="problem" role="alert" style="color: #b00020"></p>
 <form id="f" method="post">
   <input type="hidden" name="manifest" id="manifest">
   <button type="submit">Create GitHub App</button>
@@ -34,17 +39,27 @@ const template = {
   url: "{{APP_URL}}",
   description: "Keeps developers and coding agents inside your architecture.",
   public: false,
-  hook_attributes: { url: "{{APP_URL}}/api/github/webhook", active: true },
+  hook_attributes: { url: "{{WEBHOOK_URL}}/api/github/webhook", active: true },
   redirect_url: "{{APP_URL}}/setup/github-app",
   callback_urls: ["{{APP_URL}}/api/auth/callback"],
-  setup_url: "{{APP_URL}}/dashboard",
-  default_permissions: { metadata: "read", contents: "write", pull_requests: "write", statuses: "write", workflows: "write" },
+  setup_url: "{{APP_URL}}/api/auth/login",
+  default_permissions: { metadata: "read", contents: "write", pull_requests: "write", statuses: "write", workflows: "write", members: "read" },
   default_events: ["pull_request", "pull_request_review"],
 };
+const clean = (id) => document.getElementById(id).value.trim().replace(/\/+$/, "");
+for (const [k, v] of new URLSearchParams(location.search)) {
+  if (["url", "webhook", "name", "org"].includes(k)) document.getElementById(k).value = v;
+}
 document.getElementById("f").addEventListener("submit", (e) => {
-  const base = document.getElementById("url").value.trim().replace(/\/+$/, "");
+  const base = clean("url");
+  const webhook = clean("webhook") || base;
+  const problem = /^https:\/\//.test(webhook) && !/^https:\/\/(localhost|127\.|\[::1\])/.test(webhook)
+    ? ""
+    : "GitHub cannot reach that webhook URL. Use a public https address, such as a tunnel.";
+  document.getElementById("problem").textContent = problem;
+  if (problem) return e.preventDefault();
   const org = document.getElementById("org").value.trim();
-  const manifest = JSON.parse(JSON.stringify(template).replaceAll("{{APP_URL}}", base));
+  const manifest = JSON.parse(JSON.stringify(template).replaceAll("{{APP_URL}}", base).replaceAll("{{WEBHOOK_URL}}", webhook));
   manifest.name = document.getElementById("name").value.trim() || "Voxium";
   document.getElementById("manifest").value = JSON.stringify(manifest);
   e.target.action = org

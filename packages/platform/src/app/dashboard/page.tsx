@@ -1,7 +1,8 @@
 import { redirect } from "next/navigation";
 import { currentUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
-import { listOrgsForUser, listRepos } from "@/lib/store";
+import { canManage } from "@/lib/access";
+import { listMemberships, listOrgsForUser, listReposForUser } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +18,8 @@ export default async function Dashboard({ searchParams }: { searchParams: Promis
   const env = getEnv();
   const { error } = await searchParams;
   const orgs = await listOrgsForUser(env.DB, user.id);
-  const withRepos = await Promise.all(orgs.map(async (o) => ({ org: o, repos: await listRepos(env.DB, o.id) })));
+  const withRepos = await Promise.all(orgs.map(async (o) => ({ org: o, repos: await listReposForUser(env.DB, user.id, o.id) })));
+  const unreadable = (await listMemberships(env.DB, user.id)).filter((m) => m.state === "error");
   const installUrl = `https://github.com/apps/${env.GITHUB_APP_SLUG}/installations/new`;
 
   return (
@@ -25,26 +27,34 @@ export default async function Dashboard({ searchParams }: { searchParams: Promis
       <div className="row">
         <h1>Dashboard</h1>
         <span className="muted">
-          {user.login} · <a href="/api/auth/logout">Sign out</a>
+          {user.login} · <a href="/api/auth/login">Refresh access</a> · <a href="/api/auth/logout">Sign out</a>
         </span>
       </div>
       {error && <div className="card error">{error}</div>}
 
-      {withRepos.length === 0 && (
+      {unreadable.map((m) => (
+        <div className="card error" key={m.org_id}>
+          Voxium could not read your access to {m.account_login}, so nothing from it is shown. The app may be suspended there, or
+          an organization owner may still have to approve its permissions (Members, read). Then use Refresh access.
+        </div>
+      ))}
+
+      {withRepos.length === 0 && unreadable.length === 0 && (
         <div className="card">
           <p>No organizations connected yet. Install the Voxium GitHub App on the account or organization you want to protect.</p>
+          <p className="muted">Already installed? Sign in to your organization's single sign on at GitHub first, then use Refresh access.</p>
           <a className="btn" href={installUrl}>Install the GitHub App</a>
         </div>
       )}
 
       {withRepos.map(({ org, repos }) => {
-        const canSetup = org.role === "owner" || org.role === "team_leader";
+        const canSetup = canManage(org.role);
         return (
           <section key={org.id}>
             <h2>
               {org.account_login} <span className="badge">{org.role.replace("_", " ")}</span>
             </h2>
-            {repos.length === 0 && <p className="muted">No repositories shared with the app yet.</p>}
+            {repos.length === 0 && <p className="muted">No repositories you can open are shared with the app.</p>}
             {repos.map((r) => {
               const s = STATUS[r.status] ?? STATUS.connected;
               return (
@@ -58,9 +68,11 @@ export default async function Dashboard({ searchParams }: { searchParams: Promis
                       </div>
                     )}
                   </div>
-                  {canSetup && r.status === "connected" && (
+                  {canSetup && r.level !== "read" && r.status !== "active" && (
                     <form method="post" action={`/api/repos/${r.id}/setup`}>
-                      <button type="submit">Set up Voxium</button>
+                      <button type="submit" title={r.status === "setup_pr_open" ? "Replaces the files in the setup pull request" : undefined}>
+                        {r.status === "setup_pr_open" ? "Redo setup PR" : "Set up Voxium"}
+                      </button>
                     </form>
                   )}
                 </div>

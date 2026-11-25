@@ -1,7 +1,9 @@
 import { notFound, redirect } from "next/navigation";
+import { githubRepoLevel } from "@/lib/access";
 import { currentUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
-import { getRepo, getRole, listAnalyses } from "@/lib/store";
+import { getInstallationToken } from "@/lib/github";
+import { getOrg, getRepo, getRole, listAnalyses } from "@/lib/store";
 import type { InferenceSummary, PrCheckOutcome } from "@/lib/analysis-types";
 
 export const dynamic = "force-dynamic";
@@ -12,7 +14,16 @@ export default async function RepoPage({ params }: { params: Promise<{ id: strin
   const env = getEnv();
   const repo = await getRepo(env.DB, Number((await params).id));
   if (!repo) notFound();
-  if (!(await getRole(env.DB, user.id, repo.org_id))) notFound();
+  const org = await getOrg(env.DB, repo.org_id);
+  if (!org || !(await getRole(env.DB, user.id, org.id))) notFound();
+  // Ask GitHub now. Results name files and rules, so they are only for people who can open the repo.
+  const level = await getInstallationToken({ appId: env.GITHUB_APP_ID, privateKey: env.GITHUB_APP_PRIVATE_KEY }, org.installation_id)
+    .then((token) => githubRepoLevel(token, repo.full_name, user))
+    .catch((err) => {
+      console.error("access check failed", repo.full_name, err);
+      return null;
+    });
+  if (!level) notFound();
 
   const analyses = await listAnalyses(env.DB, repo.id);
   const inference = analyses.find((a) => a.kind === "inference");

@@ -14,7 +14,13 @@ import {
   upsertBlock,
   validateArchitecture,
   renderAgentRules,
+  buildSetupFiles,
+  cliPackageInWorkflow,
+  mergeMcpConfig,
+  parseCliPackage,
+  renderWorkflow,
   BLOCK_START,
+  expandSymlinks,
   moduleDependencies,
   assignModules,
   detectBuildOutput,
@@ -226,6 +232,51 @@ describe("schema and generation", () => {
   });
 });
 
+describe("running the CLI from npm", () => {
+  const WF = ".github/workflows/voxium.yml";
+  const unpinned = JSON.stringify({ mcpServers: { voxium: { command: "npx", args: ["voxium", "mcp"] }, other: { command: "x" } } });
+
+  it.each(["voxium", "voxium@latest", "voxium@^1.2.3", "voxium@1.2", "voxium@1.2.3 && curl x", "voxium@1.2.3\nrun: x", "--yes@1.2.3", "git+https://x/y@1.2.3", "../voxium@1.2.3"])(
+    "refuses anything but an exact version: %j",
+    (spec) => {
+      expect(() => parseCliPackage(spec)).toThrow(/exact published version/);
+      expect(() => buildSetupFiles({ arch: base, baseline: [], cliPackage: spec })).toThrow();
+    },
+  );
+
+  it.each([["voxium@1.2.3"], ["@voxium/cli@0.1.0-beta.1"]])("accepts %s", (spec) => {
+    expect(parseCliPackage(` ${spec} `)).toBe(spec);
+    expect(cliPackageInWorkflow(renderWorkflow(spec))).toBe(spec);
+  });
+
+  it("writes nothing that downloads and runs code unless a package is given", () => {
+    const files = buildSetupFiles({ arch: base, baseline: [] });
+    expect(Object.keys(files).sort()).toEqual(["AGENTS.md", "CLAUDE.md", "voxium/CODEOWNERS.suggested", "voxium/architecture.json", "voxium/baseline.json"]);
+    expect(Object.values(files).join("\n")).not.toMatch(/npx|npm /);
+  });
+
+  it("uses the exact version everywhere when a package is given", () => {
+    const files = buildSetupFiles({ arch: base, baseline: [], cliPackage: "voxium@1.2.3" });
+    expect(files[WF]).toContain('run: npx --yes voxium@1.2.3 check --root');
+    expect(JSON.parse(files[".mcp.json"]).mcpServers.voxium).toEqual({ command: "npx", args: ["--yes", "voxium@1.2.3", "mcp"] });
+    expect(files["CLAUDE.md"]).toContain("npx --yes voxium@1.2.3 check");
+    expect(Object.values(files).join("\n").match(/npx --yes (?!voxium@1\.2\.3 )/)).toBeNull();
+  });
+
+  it("removes the unpinned server older versions wrote, and leaves every other server alone", () => {
+    expect(JSON.parse(mergeMcpConfig(unpinned)!).mcpServers).toEqual({ other: { command: "x" } });
+    expect(JSON.parse(mergeMcpConfig(unpinned, "voxium@1.2.3")!).mcpServers.voxium.args).toEqual(["--yes", "voxium@1.2.3", "mcp"]);
+    expect(mergeMcpConfig(JSON.stringify({ mcpServers: { voxium: { command: "node", args: ["mine.js"] } } }))).toBeUndefined();
+    expect(mergeMcpConfig(undefined)).toBeUndefined();
+    for (const bad of ["{", "null", "[]", "1"]) expect(mergeMcpConfig(bad, "voxium@1.2.3")).toBeUndefined();
+  });
+
+  it("does not take an unpinned version from an existing workflow", () => {
+    expect(cliPackageInWorkflow(renderWorkflow("voxium@1.2.3").replace("voxium@1.2.3", "voxium"))).toBeUndefined();
+    expect(cliPackageInWorkflow(undefined)).toBeUndefined();
+  });
+});
+
 const ids = (files: Record<string, string>, arch: Architecture = base) =>
   failing(checkArchitecture(arch, buildGraphFromFiles(files))).map((v) => v.id);
 
@@ -279,11 +330,17 @@ describe("ignored files", () => {
     const files = { "src/ui/a.ts": "", "src/data/gen/d.ts": `import "../../ui/a";` };
     expect(ids(files)).toHaveLength(1);
     expect(ids(files, { ...base, ignore: ["src/data/gen/**"] })).toEqual([]);
+    // Importing an ignored file still counts as importing what it leads to.
+    expect(ids({ ...files, "src/data/d.ts": `import "./gen/d";` }, { ...base, ignore: ["src/data/gen/**"] })).toEqual([
+      "L1:src/data/d.ts->src/data/gen/d.ts=>ui",
+    ]);
     expect(validateArchitecture({ ...base, ignore: [1] }).ok).toBe(false);
   });
 
   it("proposes ignoring committed build output, never source", () => {
-    expect(detectBuildOutput(["dist/index.js", "packages/a/dist/x.mjs", "src/build/x.js", "build/tool.ts", "out/a.js", "out/b.ts"])).toEqual([
+    expect(detectBuildOutput(["dist/index.js", "packages/a/dist/x.mjs", "src/build/x.js", "build/tool.ts", "out/a.js", "out/b.ts", ".yarn/releases/y.cjs", "a/.pnp.cjs"])).toEqual([
+      ".yarn/**",
+      "a/.pnp.cjs",
       "dist/**",
       "packages/a/dist/**",
     ]);
@@ -305,6 +362,32 @@ describe("protected files", () => {
     expect(tightenBaseline(b("x"), b("x", "y"))).toEqual(["x"]);
     expect(tightenBaseline(b("x"), "{")).toEqual(["x"]);
     expect(tightenBaseline(b("x"), null)).toEqual([]);
+  });
+});
+
+describe("scanner cost", () => {
+  it("stays linear on files with many keywords and no strings", () => {
+    const t = Date.now();
+    expect(extractImports(`${"export default foo\n".repeat(200_000)}import "./a";`)).toEqual(["./a"]);
+    expect(Date.now() - t).toBeLessThan(2000);
+  });
+
+  it("still finds names that are keywords", () => {
+    expect(extractImports(`export { x as import } from "./a"; import { export as y } from "./b";`).sort()).toEqual(["./a", "./b"]);
+  });
+});
+
+describe("symlinks", () => {
+  it("follows links to files, folders and other links", () => {
+    const files = { "src/ui/a.ts": "export {};", "src/data/d.ts": `import "./file"; import "./dir/a"; import "./twice";` };
+    const links = { "src/data/file.ts": "src/ui/a.ts", "src/data/dir": "src/ui", "src/data/twice.ts": "src/data/file.ts" };
+    const g = buildGraphFromFiles(expandSymlinks(files, links));
+    expect(failing(checkArchitecture(base, g)).map((v) => v.id).sort()).toEqual([
+      "L1:src/data/dir/a.ts->src/ui/a.ts",
+      "L1:src/data/file.ts->src/ui/a.ts",
+      "L1:src/data/twice.ts->src/ui/a.ts",
+    ]);
+    expect(expandSymlinks(files, { a: "b", b: "a" })).toEqual(files); // a loop
   });
 });
 
@@ -335,5 +418,30 @@ describe("git", () => {
     expect(rules["voxium/baseline.json"]).toBeNull();
     expect(() => readProtectedAtRef(root, "nope")).toThrow(/no such commit/);
     expect(() => readProtectedAtRef(root, "--help")).toThrow(/no such commit/);
+  });
+
+  it("reads submodules, nested repos and symlinks, and survives odd work trees", () => {
+    const lib = project({ "a.ts": "export {};", "dist/x.ts": "1" });
+    git(lib, "init", "-q", "-b", "main");
+    git(lib, "add", "-A");
+    git(lib, "commit", "-qm", "x");
+    const root = project({ "src/ui/p.ts": "export {};", "src/gone/x.ts": "1" });
+    git(root, "init", "-q", "-b", "main");
+    git(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "packages/lib");
+    fs.mkdirSync(path.join(root, "nested"));
+    fs.writeFileSync(path.join(root, "nested/n.ts"), "1");
+    git(path.join(root, "nested"), "init", "-q");
+    fs.mkdirSync(path.join(root, "src/data"));
+    fs.symlinkSync("../ui/p.ts", path.join(root, "src/data/link.ts"));
+    fs.symlinkSync("/etc", path.join(root, "src/data/outside"));
+    fs.symlinkSync("missing.ts", path.join(root, "src/data/broken.ts"));
+    git(root, "add", "-A", "src");
+    git(root, "commit", "-qm", "x");
+    fs.rmSync(path.join(root, "src/gone"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src/gone"), "now a file");
+
+    const files = readProjectFiles(root);
+    expect(Object.keys(files).sort()).toEqual(["nested/n.ts", "packages/lib/a.ts", "packages/lib/dist/x.ts", "src/data/link.ts", "src/ui/p.ts"]);
+    expect(failing(checkArchitecture(base, buildGraphFromFiles(files))).map((v) => v.id)).toEqual(["L1:src/data/link.ts->src/ui/p.ts"]);
   });
 });

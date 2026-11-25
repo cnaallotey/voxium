@@ -2,7 +2,7 @@
 
 Keep developers and coding agents inside your architecture.
 
-Voxium infers or defines your architecture, writes it to `voxium/architecture.json`, gives agents the rules (CLAUDE.md, AGENTS.md), and blocks violating changes in CI.
+Voxium infers or defines your architecture, writes it to `voxium/architecture.json`, gives agents the rules (CLAUDE.md, AGENTS.md), and blocks pull requests that violate it.
 
 See SPEC.md for the full product spec.
 
@@ -33,22 +33,35 @@ How it works: the repo holds the rules (`voxium/architecture.json`). The platfor
 
 ## What stops a PR from getting around the rules
 
-* A PR that changes `voxium/architecture.json`, `voxium/baseline.json` or `.github/workflows/voxium.yml` fails `voxium/rules` until an Owner or Team Leader with write access approves that exact commit in a GitHub review. It is then judged by the rules they approved. Removing baseline debt needs no approval.
+* A PR that changes `voxium/architecture.json`, `voxium/baseline.json` or `.github/workflows/voxium.yml` fails `voxium/rules` until an Owner or Team Leader with write access approves that exact commit in a GitHub review. It is then judged by the rules they approved. If the rules on the base branch changed meanwhile, the branch has to be updated first. Removing baseline debt needs no approval.
 * `voxium/rules` is only ever written by a check against the default branch. PRs into another branch report as `voxium/rules (branch name)`. Require that name if you protect the branch.
 * Files outside every module are followed: importing one counts as importing everything it leads to.
-* Committed files are not skipped because of their folder name. List build output in `ignore` in the architecture file.
-* If any source file cannot be read (over 1 MB, over the 40 MB total, symlinked, or excluded from archives), the check is an error, not a pass.
+* Committed files are not skipped because of their folder name. List build output in `ignore` in the architecture file. Ignored files are not judged themselves, but importing one still counts as importing what it leads to.
+* Every file is compared with its git hash, so `.gitattributes` cannot show the check something else than what is committed. If a source file cannot be read as committed (over 4 MB, over the 40 MB total, symlinked, or changed by `.gitattributes`), the check is an error, not a pass. Ignored files are exempt as long as no checked code leads to them.
+* When several checks of one commit overlap, only the newest one reports.
 
 Repository settings that this depends on: require the `voxium/rules` status **with the Voxium app as its source** (otherwise anyone who can push can post that status), require branches to be up to date, and put `voxium/CODEOWNERS.suggested` in `.github/CODEOWNERS` with code owner review required.
 
-The generated GitHub Actions job uses the rules from the default branch, but a PR can still edit workflow files. Without the platform, CODEOWNERS review is what protects them.
+## Running the CLI from npm
+
+Generated files never tell a machine to run an unpinned package. `.github/workflows/voxium.yml`, the `.mcp.json` entry and the `npx` line in the agent rules are only written when you name an exact published version, such as `voxium@1.2.3`: set `VOXIUM_CLI_PACKAGE` for the platform, or pass `--cli-package` to `init` and `generate`. Leave it empty until the CLI is on npm under an account you control. Anyone can register a name that is not taken, and those files would run their code. The `voxium/rules` status does not use npm.
+
+That GitHub Actions job uses the rules from the default branch, but a PR can still edit workflow files. Without the platform, CODEOWNERS review is what protects them.
+
+## Who can see and do what
+
+GitHub decides, and the platform never grants more than GitHub would.
+
+* Owner is an admin of the GitHub organization, or the account holder of a personal account. Nobody becomes Owner by signing in first.
+* Roles and the list of repos are refreshed from GitHub at every sign in. Sessions last 8 hours. "Refresh access" on the dashboard does it sooner. Losing sight of an organization (suspended app, no SSO session) takes access away but keeps a Team Leader's role for when it returns. Leaving the organization ends it.
+* Opening a repo page, starting setup and counting an approval each ask GitHub again at that moment. If GitHub cannot answer, access is refused.
 
 ## Commands
 
-* `init`: infer an architecture, write it with a baseline, agent rules and the CI workflow.
+* `init`: infer an architecture, write it with a baseline and agent rules. `--cli-package <name@version>` adds the CI workflow and `.mcp.json`.
 * `infer`: print the inferred architecture only.
 * `check`: exit 1 on new blocking violations. Formats: text, json, github. `--rules-from <ref>` takes the rules and baseline from a git ref instead of the working tree.
-* `generate`: regenerate agent rules, `.mcp.json` and the workflow from the architecture file.
+* `generate`: regenerate agent rules from the architecture file, and the workflow and `.mcp.json` when the workflow already pins a version or `--cli-package` gives one.
 * `mcp`: run the MCP server over stdio. Tools: `get_architecture`, `get_rules_for_path`, `check_import`, `check_change`, `propose_architecture_change`.
 
 ## Rule types
@@ -61,8 +74,8 @@ The generated GitHub Actions job uses the rules from the default branch, but a P
 * Inference proposes modules from top level folders and orders layers by import direction. Modules with no imports between them are ordered arbitrarily, so review the layers.
 * Agents can suggest architecture changes through MCP (saved as pending proposals), but nothing approves them yet. The approval flow belongs to the platform.
 * Approval works through GitHub reviews, and GitHub does not let authors approve their own PR. A solo owner has to merge an architecture change with an admin override. The logged self approval in the spec is not built.
-* Approval is only as trustworthy as the roles behind it. The first person to sign in becomes Owner of an installation, which still needs a stricter rule.
-* Imports through symlinked folders, or in forms the import scanner does not recognise, are not seen.
+* There is no screen for making someone a Team Leader yet, so for now only Owners can approve architecture changes.
+* Imports in forms the import scanner does not recognise are not seen. The CLI follows symlinks and reads submodules. The platform does neither: a symlinked source file is an error there, and imports through a symlinked folder or into a submodule are not seen.
 * Without the platform, an exception that has already expired can be removed in a PR but not renewed without an admin override.
 * Not built yet: org level approval flow for architecture changes, remote MCP server on Workers, billing, generated test files, Queues for large repos.
 * The platform has been verified with unit tests and in the local Workers runtime with a local D1. It has not been run against a real GitHub App yet.

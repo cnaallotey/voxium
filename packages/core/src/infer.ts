@@ -1,4 +1,5 @@
-import { assignModules, checkArchitecture, moduleDependencies, withoutIgnored } from "./check.js";
+import { assignModules, checkArchitecture, moduleDependencies } from "./check.js";
+import { matchesAny } from "./glob.js";
 import { IGNORE_DIRS } from "./graph.js";
 import type { Architecture, InferResult, ProjectGraph } from "./types.js";
 
@@ -73,23 +74,29 @@ export function detectBuildOutput(paths: string[]): string[] {
     const js = dirs[i].startsWith(".") || /\.(?:js|mjs|cjs)$/.test(p);
     onlyJs.set(dir, (onlyJs.get(dir) ?? true) && js);
   }
-  return [...onlyJs].filter(([, js]) => js).map(([dir]) => `${dir}/**`).sort();
+  const pnp = paths.filter((p) => /(?:^|\/)\.pnp\.(?:c?js|loader\.mjs)$/.test(p)); // written by Yarn
+  return [...[...onlyJs].filter(([, js]) => js).map(([dir]) => `${dir}/**`), ...pnp].sort();
 }
 
-/** Pass every source path in the repo as "paths" when some files were too large to be part of the graph. */
-export function inferArchitecture(input: ProjectGraph, opts: { paths?: string[] } = {}): InferResult {
+/** "unread" lists files in the graph whose contents could not be read. They are proposed as ignored too. */
+export function inferArchitecture(graph: ProjectGraph, opts: { unread?: string[] } = {}): InferResult {
   const notes: string[] = [];
-  const ignore = detectBuildOutput(opts.paths ?? input.files);
-  const graph = withoutIgnored(input, ignore);
-  if (ignore.length) {
-    notes.push(`Treated as build output and not checked: ${ignore.join(", ")}. Remove from "ignore" if any of it is source code.`);
+  const output = detectBuildOutput(graph.files);
+  const unread = (opts.unread ?? []).filter((p) => !matchesAny(p, output));
+  const ignore = [...output, ...unread];
+  const files = graph.files.filter((f) => !matchesAny(f, ignore));
+  if (output.length) {
+    notes.push(`Treated as build output or tooling and not checked: ${output.join(", ")}. Remove from "ignore" if any of it is source code.`);
   }
-  const srcRoot = pickSourceRoot(graph.files);
+  if (unread.length) {
+    notes.push(`Could not be read and not checked: ${unread.join(", ")}. Nothing in the checked code imports them today.`);
+  }
+  const srcRoot = pickSourceRoot(files);
   const prefix = srcRoot ? `${srcRoot}/` : "";
 
   // Count files per candidate folder.
   const counts = new Map<string, number>();
-  for (const f of graph.files) {
+  for (const f of files) {
     if (!f.startsWith(prefix)) continue;
     const rest = f.slice(prefix.length);
     const parts = rest.split("/");
@@ -205,7 +212,7 @@ export function inferArchitecture(input: ProjectGraph, opts: { paths?: string[] 
       "Modules with no imports between them are ordered arbitrarily. If you expect one to depend on another later, check that it sits above it in the layer order.",
     );
   }
-  const unassigned = graph.files.length - modOf.size;
+  const unassigned = files.length - modOf.size;
   if (unassigned > 0) {
     notes.push(`${unassigned} file(s) sit outside any module (for example root level files) and are not checked themselves. Importing one counts as importing everything it leads to.`);
   }

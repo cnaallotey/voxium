@@ -1,10 +1,10 @@
 // Runtime agnostic entry point. No node:* imports, safe for Cloudflare Workers.
 // Disk helpers live in "@voxium/core/node".
 export * from "./types.js";
-export { buildGraphFromFiles, isSourcePath, IGNORE_DIRS, SOURCE_EXT } from "./graph.js";
+export { buildGraphFromFiles, expandSymlinks, isSourcePath, IGNORE_DIRS, SOURCE_EXT } from "./graph.js";
 export type { FileMap, BuildGraphOptions } from "./graph.js";
 export { extractImports, blankCommentsAndTemplates } from "./imports.js";
-export { checkArchitecture, failing, assignModules, findCycles, moduleDependencies, withoutIgnored } from "./check.js";
+export { checkArchitecture, failing, assignModules, findCycles, moduleDependencies } from "./check.js";
 export type { Dependency } from "./check.js";
 export { inferArchitecture, orderLayers, detectBuildOutput } from "./infer.js";
 export { validateArchitecture } from "./schema.js";
@@ -14,6 +14,8 @@ export {
   renderCodeowners,
   upsertBlock,
   mergeMcpConfig,
+  parseCliPackage,
+  cliPackageInWorkflow,
   buildSetupFiles,
   BLOCK_START,
   BLOCK_END,

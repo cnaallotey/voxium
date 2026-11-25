@@ -1,6 +1,7 @@
 import type { D1Database } from "./d1";
 
 export type Role = "owner" | "team_leader" | "member";
+export type AccessLevel = "read" | "write" | "admin";
 
 export interface UserRow {
   id: number;
@@ -12,6 +13,7 @@ export interface UserRow {
 export interface OrgRow {
   id: number;
   installation_id: number;
+  account_id: number | null;
   account_login: string;
   account_type: string;
 }
@@ -53,29 +55,91 @@ export async function getUser(db: D1Database, id: number): Promise<UserRow | nul
   return db.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<UserRow>();
 }
 
-export async function upsertOrg(db: D1Database, o: { installation_id: number; account_login: string; account_type: string }): Promise<OrgRow> {
+export async function upsertOrg(db: D1Database, o: { installation_id: number; account_id: number; account_login: string; account_type: string }): Promise<OrgRow> {
   await db
     .prepare(
-      `INSERT INTO orgs (installation_id, account_login, account_type) VALUES (?, ?, ?)
-       ON CONFLICT(installation_id) DO UPDATE SET account_login = excluded.account_login, account_type = excluded.account_type`,
+      `INSERT INTO orgs (installation_id, account_id, account_login, account_type) VALUES (?, ?, ?, ?)
+       ON CONFLICT(installation_id) DO UPDATE SET account_id = excluded.account_id, account_login = excluded.account_login, account_type = excluded.account_type`,
     )
-    .bind(o.installation_id, o.account_login, o.account_type)
+    .bind(o.installation_id, o.account_id, o.account_login, o.account_type)
     .run();
   return (await db.prepare("SELECT * FROM orgs WHERE installation_id = ?").bind(o.installation_id).first<OrgRow>())!;
 }
 
-/** The first person linked to an org becomes its owner. Everyone after that starts as a member. */
-export async function ensureMembership(db: D1Database, userId: number, orgId: number): Promise<Role> {
-  const existing = await db.prepare("SELECT role FROM memberships WHERE user_id = ? AND org_id = ?").bind(userId, orgId).first<{ role: Role }>();
-  if (existing) return existing.role;
-  const any = await db.prepare("SELECT 1 AS x FROM memberships WHERE org_id = ? LIMIT 1").bind(orgId).first();
-  const role: Role = any ? "member" : "owner";
-  await db.prepare("INSERT INTO memberships (user_id, org_id, role) VALUES (?, ?, ?)").bind(userId, orgId, role).run();
-  return role;
+export async function setMembership(db: D1Database, userId: number, orgId: number, role: Role): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO memberships (user_id, org_id, role, state) VALUES (?, ?, ?, 'active')
+       ON CONFLICT(user_id, org_id) DO UPDATE SET role = excluded.role, state = 'active'`,
+    )
+    .bind(userId, orgId, role)
+    .run();
+}
+
+/** The role on record, whether or not the membership is usable right now. Only for deciding a new one. */
+export async function getStoredRole(db: D1Database, userId: number, orgId: number): Promise<Role | null> {
+  const r = await db.prepare("SELECT role FROM memberships WHERE user_id = ? AND org_id = ?").bind(userId, orgId).first<{ role: Role }>();
+  return r?.role ?? null;
+}
+
+export interface MembershipRow {
+  org_id: number;
+  account_login: string;
+  role: Role;
+  state: "active" | "gone" | "error";
+}
+
+export async function listMemberships(db: D1Database, userId: number): Promise<MembershipRow[]> {
+  const res = await db
+    .prepare(
+      `SELECT m.org_id, o.account_login, m.role, m.state FROM memberships m JOIN orgs o ON o.id = m.org_id
+       WHERE m.user_id = ? ORDER BY o.account_login`,
+    )
+    .bind(userId)
+    .all<MembershipRow>();
+  return res.results;
+}
+
+/** Take away all access in an org while keeping the role on record. */
+export async function suspendMembership(db: D1Database, userId: number, orgId: number, state: "gone" | "error"): Promise<void> {
+  await db.batch([
+    accessDelete(db, userId, orgId),
+    db
+      .prepare(
+        `INSERT INTO memberships (user_id, org_id, role, state) VALUES (?, ?, 'member', ?)
+         ON CONFLICT(user_id, org_id) DO UPDATE SET state = excluded.state`,
+      )
+      .bind(userId, orgId, state),
+  ]);
+}
+
+function accessDelete(db: D1Database, userId: number, orgId: number) {
+  return db.prepare("DELETE FROM repo_access WHERE user_id = ? AND repo_id IN (SELECT id FROM repos WHERE org_id = ?)").bind(userId, orgId);
+}
+
+/** Replace what a user can see in an org. Repos that are not listed lose access. */
+export async function replaceRepoAccess(
+  db: D1Database,
+  userId: number,
+  orgId: number,
+  repos: Array<{ id: number; permissions?: { admin?: boolean; maintain?: boolean; push?: boolean } }>,
+): Promise<void> {
+  const insert = db.prepare(
+    // GitHub can repeat a repo across pages when the list changes while it is being read.
+    `INSERT INTO repo_access (user_id, repo_id, level) SELECT ?, id, ? FROM repos WHERE github_repo_id = ? AND org_id = ?
+     ON CONFLICT(user_id, repo_id) DO UPDATE SET level = excluded.level`,
+  );
+  const rows = repos.map((r) => {
+    const p = r.permissions ?? {};
+    const level: AccessLevel = p.admin ? "admin" : p.maintain || p.push ? "write" : "read";
+    return insert.bind(userId, level, r.id, orgId);
+  });
+  await db.batch([accessDelete(db, userId, orgId), ...rows.slice(0, 49)]);
+  for (let i = 49; i < rows.length; i += 50) await db.batch(rows.slice(i, i + 50));
 }
 
 export async function getRole(db: D1Database, userId: number, orgId: number): Promise<Role | null> {
-  const r = await db.prepare("SELECT role FROM memberships WHERE user_id = ? AND org_id = ?").bind(userId, orgId).first<{ role: Role }>();
+  const r = await db.prepare("SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND state = 'active'").bind(userId, orgId).first<{ role: Role }>();
   return r?.role ?? null;
 }
 
@@ -83,7 +147,7 @@ export async function listOrgsForUser(db: D1Database, userId: number): Promise<A
   const res = await db
     .prepare(
       `SELECT o.*, m.role FROM orgs o JOIN memberships m ON m.org_id = o.id
-       WHERE m.user_id = ? ORDER BY o.account_login`,
+       WHERE m.user_id = ? AND m.state = 'active' ORDER BY o.account_login`,
     )
     .bind(userId)
     .all<OrgRow & { role: Role }>();
@@ -113,8 +177,18 @@ export async function deleteOrgByInstallation(db: D1Database, installationId: nu
   await db.prepare("DELETE FROM orgs WHERE installation_id = ?").bind(installationId).run();
 }
 
-export async function listRepos(db: D1Database, orgId: number): Promise<RepoRow[]> {
-  return (await db.prepare("SELECT * FROM repos WHERE org_id = ? ORDER BY full_name").bind(orgId).all<RepoRow>()).results;
+/** Repos in an org that the user can open on GitHub, as of their last sign in. */
+export async function listReposForUser(db: D1Database, userId: number, orgId: number): Promise<Array<RepoRow & { level: AccessLevel }>> {
+  const res = await db
+    .prepare(
+      `SELECT r.*, a.level FROM repos r
+       JOIN repo_access a ON a.repo_id = r.id AND a.user_id = ?
+       JOIN memberships m ON m.org_id = r.org_id AND m.user_id = a.user_id AND m.state = 'active'
+       WHERE r.org_id = ? ORDER BY r.full_name`,
+    )
+    .bind(userId, orgId)
+    .all<RepoRow & { level: AccessLevel }>();
+  return res.results;
 }
 
 export async function getRepo(db: D1Database, id: number): Promise<RepoRow | null> {
@@ -125,6 +199,7 @@ export async function getRepoByGithubId(db: D1Database, githubRepoId: number): P
   return db.prepare("SELECT * FROM repos WHERE github_repo_id = ?").bind(githubRepoId).first<RepoRow>();
 }
 
+/** Role on record. Callers must confirm it with GitHub, so a lapsed sign in does not matter here. */
 export async function getRoleByGithubUser(db: D1Database, githubUserId: number, orgId: number): Promise<Role | null> {
   const r = await db
     .prepare("SELECT m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.github_id = ? AND m.org_id = ?")
@@ -143,6 +218,28 @@ export async function getOrgByInstallation(db: D1Database, installationId: numbe
 
 export async function setRepoSetup(db: D1Database, repoId: number, status: string, prUrl: string | null): Promise<void> {
   await db.prepare("UPDATE repos SET status = ?, setup_pr_url = ? WHERE id = ?").bind(status, prUrl, repoId).run();
+}
+
+/** Claim the next run number for a check of one commit. */
+export async function beginCheck(db: D1Database, githubRepoId: number, sha: string, context: string): Promise<number> {
+  await db.prepare("DELETE FROM check_runs WHERE updated_at < datetime('now', '-7 days')").run();
+  const row = await db
+    .prepare(
+      `INSERT INTO check_runs (github_repo_id, sha, context) VALUES (?, ?, ?)
+       ON CONFLICT(github_repo_id, sha, context) DO UPDATE SET run = run + 1, updated_at = datetime('now') RETURNING run`,
+    )
+    .bind(githubRepoId, sha, context)
+    .first<{ run: number }>();
+  return row!.run;
+}
+
+/** False when a newer run for the same commit has started. */
+export async function isLatestCheck(db: D1Database, githubRepoId: number, sha: string, context: string, run: number): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT run FROM check_runs WHERE github_repo_id = ? AND sha = ? AND context = ?")
+    .bind(githubRepoId, sha, context)
+    .first<{ run: number }>();
+  return row?.run === run;
 }
 
 export async function saveAnalysis(

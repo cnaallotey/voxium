@@ -19,7 +19,9 @@
     "APP_URL": "http://localhost:3000",
     "GITHUB_APP_ID": "",
     "GITHUB_APP_SLUG": "voxium",
-    "GITHUB_CLIENT_ID": ""
+    "GITHUB_CLIENT_ID": "",
+    // Exact published CLI version for setup pull requests, such as "voxium@1.2.3". Leave empty until it is on npm.
+    "VOXIUM_CLI_PACKAGE": ""
   }
   // Secrets, set with "wrangler secret put":
   //   GITHUB_APP_PRIVATE_KEY, GITHUB_CLIENT_SECRET, GITHUB_WEBHOOK_SECRET, SESSION_SECRET

@@ -11,6 +11,8 @@ export interface Env {
   GITHUB_WEBHOOK_SECRET: string;
   GITHUB_APP_PRIVATE_KEY: string;
   SESSION_SECRET: string;
+  /** Published CLI that setup pull requests may run, such as "voxium@1.2.3". Empty means none. */
+  VOXIUM_CLI_PACKAGE?: string;
 }
 
 /** Only call inside a request handler. Bindings do not exist at build time. */
