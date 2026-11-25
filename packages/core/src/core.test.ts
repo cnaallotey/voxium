@@ -15,6 +15,7 @@ import {
   validateArchitecture,
   renderAgentRules,
   buildSetupFiles,
+  describeRuleChanges,
   cliPackageInWorkflow,
   mergeMcpConfig,
   parseCliPackage,
@@ -229,6 +230,63 @@ describe("schema and generation", () => {
     expect(second.match(/voxium:start/g)).toHaveLength(1);
     expect(second).toContain("Keep this.");
     expect(second.indexOf("`data`")).toBeLessThan(second.indexOf("`ui`"));
+  });
+});
+
+describe("describing rule changes", () => {
+  const ARCH = "voxium/architecture.json";
+  const say = (change: (a: Architecture) => void) => {
+    const next = structuredClone(base);
+    change(next);
+    return describeRuleChanges({ [ARCH]: JSON.stringify(base) }, { [ARCH]: JSON.stringify(next) }, [ARCH]);
+  };
+
+  it("names every kind of change", () => {
+    const first = base.rules[0];
+    expect(say((a) => void a.rules.shift()).join()).toContain(`Removes rule ${first.id} [${first.severity}]`);
+    expect(say((a) => void (a.rules[0].severity = "warn"))).toEqual([`Changes rule ${first.id}: severity from block to warn`]);
+    expect(say((a) => void a.layers.reverse()).join()).toMatch(/Changes the layers from .* to /);
+    expect(say((a) => void (a.modules.extra = { paths: ["src/extra/**"] }))).toEqual(["Adds module extra (src/extra/**)"]);
+    expect(say((a) => void (a.modules[a.layers[0]].paths = ["nowhere/**"])).join()).toContain("nowhere/**");
+    expect(say((a) => void (a.ignore = ["src/**"]))).toEqual(["Stops checking src/**"]);
+    expect(say((a) => void a.exceptions.push({ rule: "L", file: "src/x.ts", owner: "ann", reason: "later", expires: "2030-01-01" }))).toEqual([
+      "Adds exception to L for src/x.ts until 2030-01-01 (owner ann: later)",
+    ]);
+    expect(say((a) => void (a.meta = { approvedBy: "me" })).join()).toContain("meta");
+    expect(say((a) => void Object.assign(a, { surprise: 1 })).join()).toContain("surprise");
+  });
+
+  it("mentions a change of module order, which decides who owns overlapping files", () => {
+    const text = say((a) => void (a.modules = Object.fromEntries(Object.entries(a.modules).reverse())));
+    expect(text.join()).toMatch(/which module wins/);
+  });
+
+  it("never stays silent, whatever the files hold", () => {
+    const d = (x: string | null, y: string | null) => describeRuleChanges({ [ARCH]: x }, { [ARCH]: y }, [ARCH]);
+    const ok = JSON.stringify(base);
+    expect(d(ok, null)).toEqual(["Removes voxium/architecture.json. Voxium stops checking this repository"]);
+    expect(d(ok, "{")).toEqual(["Makes voxium/architecture.json invalid"]);
+    expect(d(null, ok)[0]).toMatch(/^Adds the architecture rules/);
+    expect(d("{", ok)[0]).toMatch(/^Replaces rules that were invalid/);
+    expect(d(ok, `${ok}\n`)[0]).toMatch(/formatting/);
+    expect(describeRuleChanges({}, { ".github/workflows/voxium.yml": "on: push" }, [".github/workflows/voxium.yml"])[0]).toMatch(/^Adds/);
+  });
+
+  it("counts baseline debt", () => {
+    const B = "voxium/baseline.json";
+    const f = (v: string[]) => ({ [B]: JSON.stringify({ violations: v }) });
+    expect(describeRuleChanges(f(["a"]), f(["b", "c"]), [B])).toEqual([
+      "Accepts 2 violation(s) as existing debt: b; c",
+      "Stops accepting 1 violation(s): a",
+    ]);
+    expect(describeRuleChanges(f(["a"]), { [B]: "{" }, [B])[0]).toMatch(/unreadable/);
+    expect(describeRuleChanges(f([]), f(Array.from({ length: 8 }, (_, i) => `v${i}`)), [B])[0]).toContain("and 3 more");
+  });
+
+  it("keeps hostile text on one short line", () => {
+    const [line] = say((a) => void (a.modules.evil = { paths: [`x\n\n# Approved\u202e${"y".repeat(2000)}`] }));
+    expect(line).not.toMatch(/[\n\u202e]/);
+    expect(line.length).toBeLessThan(400);
   });
 });
 

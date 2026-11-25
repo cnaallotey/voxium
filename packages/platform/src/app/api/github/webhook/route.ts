@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { verifyWebhookSignature } from "@/lib/crypto";
 import { getEnv, waitUntil } from "@/lib/env";
+import { recordDecision } from "@/lib/decisions";
 import { getInstallationToken, listInstallationRepos } from "@/lib/github";
 import { runPullRequestCheck, updateSetupStatus } from "@/lib/repo-job";
 import { closedPrFrom, prEventFrom, type WebhookPayload } from "@/lib/webhook";
@@ -54,6 +55,7 @@ export async function POST(req: NextRequest) {
   const closed = closedPrFrom(event, body);
   if (closed) {
     waitUntil(updateSetupStatus(closed));
+    waitUntil(recordDecision(closed));
     return NextResponse.json({ ok: true, queued: true }, { status: 202 });
   }
 

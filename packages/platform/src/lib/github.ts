@@ -183,6 +183,7 @@ export interface GhReview {
   user: { id: number; login: string; type: string } | null;
   state: string;
   commit_id: string | null;
+  body?: string | null;
 }
 
 /** All reviews, oldest first. Throws rather than returning part of a very long list. */
@@ -197,6 +198,30 @@ export async function listReviews(token: string, fullName: string, number: numbe
     if (data.length < 100) return out;
   }
   throw new Error("GitHub list reviews failed: too many reviews to read");
+}
+
+export interface GhPull {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  merged: boolean;
+  html_url: string;
+  user: { id: number; login: string };
+  head: { sha: string };
+  base: { ref: string; sha: string };
+}
+
+/** A pull request as it is now, or null when it does not exist. */
+export async function getPull(token: string, fullName: string, number: number): Promise<GhPull | null> {
+  const res = await gh(token, `/repos/${fullName}/pulls/${number}`);
+  if (res.status === 404) return null;
+  return ok<GhPull>(res, "read pull request");
+}
+
+/** True only when the organization has exactly this one member. */
+export async function isOnlyMember(token: string, org: string, githubId: number): Promise<boolean> {
+  const members = await ok<Array<{ id: number }>>(await gh(token, `/orgs/${encodeURIComponent(org)}/members?per_page=2`), "list members");
+  return members.length === 1 && members[0].id === githubId;
 }
 
 export async function setCommitStatus(

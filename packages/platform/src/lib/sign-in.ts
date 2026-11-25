@@ -1,4 +1,4 @@
-import { githubStanding, resolveRole } from "./access";
+import { githubStanding } from "./access";
 import type { Env } from "./env";
 import { getInstallationToken, listUserInstallations, listUserRepos } from "./github";
 import {
@@ -6,8 +6,8 @@ import {
   getStoredRole,
   listMemberships,
   replaceRepoAccess,
-  setMembership,
   suspendMembership,
+  syncMembership,
   upsertOrg,
   upsertRepos,
   type UserRow,
@@ -36,10 +36,10 @@ export async function syncAccess(env: Env, user: UserRow, userToken: string): Pr
     try {
       if (inst.suspended_at) throw new Error("installation is suspended");
       const token = await getInstallationToken({ appId: env.GITHUB_APP_ID, privateKey: env.GITHUB_APP_PRIVATE_KEY }, inst.id);
-      const role = resolveRole(await githubStanding(token, org, user), stored);
+      const standing = await githubStanding(token, org, user);
       const repos = await listUserRepos(userToken, inst.id);
       await upsertRepos(env.DB, org.id, repos);
-      await setMembership(env.DB, user.id, org.id, role);
+      const role = await syncMembership(env.DB, user.id, org.id, standing);
       await replaceRepoAccess(env.DB, user.id, org.id, repos);
       if (stored !== role) await audit(env.DB, org.id, user.id, "role_changed", `${stored ?? "none"} to ${role}`);
       await audit(env.DB, org.id, user.id, "sign_in", role);

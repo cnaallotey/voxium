@@ -3,6 +3,8 @@ import type { GhReview } from "./github";
 export interface Approver {
   id: number;
   login: string;
+  /** What they wrote with it. */
+  reason: string | null;
 }
 
 /**
@@ -17,5 +19,5 @@ export function currentApprovals(reviews: GhReview[], headSha: string, authorId:
   }
   return [...latest.values()]
     .filter((r) => r.state === "APPROVED" && r.commit_id === headSha && r.user!.type === "User" && r.user!.id !== authorId)
-    .map((r) => ({ id: r.user!.id, login: r.user!.login }));
+    .map((r) => ({ id: r.user!.id, login: r.user!.login, reason: r.body?.trim() || null }));
 }

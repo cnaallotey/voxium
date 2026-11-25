@@ -66,14 +66,54 @@ export async function upsertOrg(db: D1Database, o: { installation_id: number; ac
   return (await db.prepare("SELECT * FROM orgs WHERE installation_id = ?").bind(o.installation_id).first<OrgRow>())!;
 }
 
-export async function setMembership(db: D1Database, userId: number, orgId: number, role: Role): Promise<void> {
-  await db
+/**
+ * Make someone's membership match GitHub and return the resulting role. A Team Leader role is kept or dropped by the
+ * database itself, so a sign in that overlaps an Owner's change to it cannot undo that change.
+ */
+export async function syncMembership(db: D1Database, userId: number, orgId: number, standing: "owner" | "member" | "outside"): Promise<Role> {
+  const row = await db
     .prepare(
       `INSERT INTO memberships (user_id, org_id, role, state) VALUES (?, ?, ?, 'active')
-       ON CONFLICT(user_id, org_id) DO UPDATE SET role = excluded.role, state = 'active'`,
+       ON CONFLICT(user_id, org_id) DO UPDATE SET state = 'active', role = CASE
+         WHEN excluded.role = 'owner' THEN 'owner'
+         WHEN ? = 'member' AND memberships.role = 'team_leader' THEN 'team_leader'
+         ELSE 'member' END
+       RETURNING role`,
     )
-    .bind(userId, orgId, role)
-    .run();
+    .bind(userId, orgId, standing === "owner" ? "owner" : "member", standing)
+    .first<{ role: Role }>();
+  return row!.role;
+}
+
+/** Assign or take away Team Leader. Owners mirror GitHub, so their role cannot be set. False when nothing changed. */
+export async function setTeamLeader(db: D1Database, userId: number, orgId: number, leader: boolean): Promise<boolean> {
+  const [from, to] = leader ? ["member", "team_leader"] : ["team_leader", "member"];
+  const row = await db
+    .prepare("UPDATE memberships SET role = ? WHERE user_id = ? AND org_id = ? AND role = ? RETURNING role")
+    .bind(to, userId, orgId, from)
+    .first();
+  return row !== null;
+}
+
+export interface PersonRow {
+  user_id: number;
+  github_id: number;
+  login: string;
+  name: string | null;
+  role: Role;
+  state: "active" | "gone" | "error";
+}
+
+/** Everyone who has signed in to Voxium and has a membership in the org. */
+export async function listPeople(db: D1Database, orgId: number): Promise<PersonRow[]> {
+  const res = await db
+    .prepare(
+      `SELECT u.id AS user_id, u.github_id, u.login, u.name, m.role, m.state FROM memberships m JOIN users u ON u.id = m.user_id
+       WHERE m.org_id = ? ORDER BY u.login`,
+    )
+    .bind(orgId)
+    .all<PersonRow>();
+  return res.results;
 }
 
 /** The role on record, whether or not the membership is usable right now. Only for deciding a new one. */
@@ -270,4 +310,79 @@ export async function listAnalyses(db: D1Database, repoId: number, limit = 20): 
 
 export async function audit(db: D1Database, orgId: number | null, userId: number | null, action: string, detail?: string): Promise<void> {
   await db.prepare("INSERT INTO audit_log (org_id, user_id, action, detail) VALUES (?, ?, ?, ?)").bind(orgId, userId, action, detail ?? null).run();
+}
+
+export interface SelfApprovalRow {
+  id: number;
+  user_id: number;
+  github_id: number;
+  login: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface PullCommit {
+  repoId: number;
+  number: number;
+  headSha: string;
+  baseRef: string;
+}
+
+export async function saveSelfApproval(db: D1Database, pull: PullCommit, userId: number, reason: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO self_approvals (repo_id, pr_number, head_sha, base_ref, user_id, reason) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(repo_id, pr_number, head_sha, base_ref) DO UPDATE SET user_id = excluded.user_id, reason = excluded.reason, created_at = datetime('now')`,
+    )
+    .bind(pull.repoId, pull.number, pull.headSha, pull.baseRef, userId, reason)
+    .run();
+}
+
+export async function getSelfApproval(db: D1Database, pull: PullCommit): Promise<SelfApprovalRow | null> {
+  return db
+    .prepare(
+      `SELECT s.id, s.user_id, u.github_id, u.login, s.reason, s.created_at FROM self_approvals s JOIN users u ON u.id = s.user_id
+       WHERE s.repo_id = ? AND s.pr_number = ? AND s.head_sha = ? AND s.base_ref = ?`,
+    )
+    .bind(pull.repoId, pull.number, pull.headSha, pull.baseRef)
+    .first<SelfApprovalRow>();
+}
+
+/** Take back an approval of this pull request, whichever commit it was for. Only the person who gave it can. */
+export async function withdrawSelfApproval(db: D1Database, repoId: number, number: number, userId: number): Promise<void> {
+  await db.prepare("DELETE FROM self_approvals WHERE repo_id = ? AND pr_number = ? AND user_id = ?").bind(repoId, number, userId).run();
+}
+
+export type DecisionKind = "setup" | "approved" | "self_approved" | "unapproved";
+
+export interface Decision {
+  github_repo_id: number;
+  pr_number: number;
+  kind: DecisionKind;
+  title: string;
+  changes: string[];
+  reason: string | null;
+  approved_by: string | null;
+  merged_by: string | null;
+  head_sha: string;
+  merged_at: string;
+}
+
+/** Log a merged rule change. The first record stands, so an event that is delivered again cannot rewrite it. */
+export async function saveDecision(db: D1Database, d: Decision): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO decisions (github_repo_id, pr_number, kind, title, changes_json, reason, approved_by, merged_by, head_sha, merged_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(github_repo_id, pr_number) DO NOTHING`,
+    )
+    .bind(d.github_repo_id, d.pr_number, d.kind, d.title, JSON.stringify(d.changes), d.reason, d.approved_by, d.merged_by, d.head_sha, d.merged_at)
+    .run();
+}
+
+export async function listDecisions(db: D1Database, githubRepoId: number, limit = 200): Promise<Decision[]> {
+  const res = await db
+    .prepare("SELECT * FROM decisions WHERE github_repo_id = ? ORDER BY merged_at DESC, id DESC LIMIT ?")
+    .bind(githubRepoId, limit)
+    .all<Omit<Decision, "changes"> & { changes_json: string }>();
+  return res.results.map(({ changes_json, ...d }) => ({ ...d, changes: JSON.parse(changes_json) as string[] }));
 }

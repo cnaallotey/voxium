@@ -1,39 +1,37 @@
 import { notFound, redirect } from "next/navigation";
-import { githubRepoLevel } from "@/lib/access";
+import { canManage } from "@/lib/access";
 import { currentUser } from "@/lib/auth";
-import { getEnv } from "@/lib/env";
-import { getInstallationToken } from "@/lib/github";
-import { getOrg, getRepo, getRole, listAnalyses } from "@/lib/store";
+import { DECISION_LABEL } from "@/lib/decisions";
+import { openRepo } from "@/lib/open-repo";
+import { listAnalyses, listDecisions } from "@/lib/store";
 import type { InferenceSummary, PrCheckOutcome } from "@/lib/analysis-types";
 
 export const dynamic = "force-dynamic";
 
-export default async function RepoPage({ params }: { params: Promise<{ id: string }> }) {
-  const user = await currentUser();
-  if (!user) redirect("/api/auth/login");
-  const env = getEnv();
-  const repo = await getRepo(env.DB, Number((await params).id));
-  if (!repo) notFound();
-  const org = await getOrg(env.DB, repo.org_id);
-  if (!org || !(await getRole(env.DB, user.id, org.id))) notFound();
-  // Ask GitHub now. Results name files and rules, so they are only for people who can open the repo.
-  const level = await getInstallationToken({ appId: env.GITHUB_APP_ID, privateKey: env.GITHUB_APP_PRIVATE_KEY }, org.installation_id)
-    .then((token) => githubRepoLevel(token, repo.full_name, user))
-    .catch((err) => {
-      console.error("access check failed", repo.full_name, err);
-      return null;
-    });
-  if (!level) notFound();
+interface Props {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ error?: string }>;
+}
+
+export default async function RepoPage({ params, searchParams }: Props) {
+  if (!(await currentUser())) redirect("/api/auth/login");
+  // Asks GitHub now. Results name files and rules, so they are only for people who can open the repo.
+  const open = await openRepo((await params).id);
+  if (!open) notFound();
+  const { env, repo, role, level } = open;
+  const { error } = await searchParams;
 
   const analyses = await listAnalyses(env.DB, repo.id);
   const inference = analyses.find((a) => a.kind === "inference");
   const summary = inference ? (JSON.parse(inference.summary_json) as InferenceSummary) : null;
   const checks = analyses.filter((a) => a.kind === "pr_check");
+  const decisions = await listDecisions(env.DB, repo.github_repo_id);
 
   return (
     <>
       <p className="muted"><a href="/dashboard">Dashboard</a> / {repo.full_name}</p>
       <h1>{repo.full_name}</h1>
+      {error && <div className="card error">{error}</div>}
       {repo.setup_pr_url && (
         <p>
           Setup pull request: <a href={repo.setup_pr_url}>{repo.setup_pr_url}</a>
@@ -67,7 +65,7 @@ export default async function RepoPage({ params }: { params: Promise<{ id: strin
           <div className="card" key={c.id}>
             <div className="row">
               <span>
-                PR #{c.pr_number} <span className={`badge ${o.state === "success" ? "ok" : "bad"}`}>{o.state}</span>
+                <a href={`/repos/${repo.id}/pulls/${c.pr_number}`}>PR #{c.pr_number}</a> <span className={`badge ${o.state === "success" ? "ok" : "bad"}`}>{o.state}</span>
               </span>
               <span className="muted">{c.created_at}</span>
             </div>
@@ -81,6 +79,37 @@ export default async function RepoPage({ params }: { params: Promise<{ id: strin
           </div>
         );
       })}
+
+      <div className="row">
+        <h2>Decision log</h2>
+        {decisions.length > 0 && canManage(role) && level !== "read" && (
+          <form method="post" action={`/api/repos/${repo.id}/decisions`}>
+            <button type="submit" className="secondary">Add to the repository</button>
+          </form>
+        )}
+      </div>
+      {decisions.length === 0 && <p className="muted">No changes to the rules have been merged yet.</p>}
+      {decisions.map((d) => (
+        <div className="card" key={d.pr_number}>
+          <div className="row">
+            <span>
+              <a href={`https://github.com/${repo.full_name}/pull/${d.pr_number}`}>#{d.pr_number}</a> {d.title}{" "}
+              <span className={`badge ${d.kind === "unapproved" ? "bad" : "ok"}`}>{DECISION_LABEL[d.kind]}</span>
+            </span>
+            <span className="muted">{d.merged_at}</span>
+          </div>
+          <ul>
+            {d.changes.map((c, i) => (
+              <li key={i}>{c}</li>
+            ))}
+          </ul>
+          {d.reason && <p style={{ whiteSpace: "pre-wrap" }}>{d.reason}</p>}
+          <div className="muted">
+            {d.approved_by && `Approved by ${d.approved_by}. `}
+            {d.merged_by && `Merged by ${d.merged_by}.`}
+          </div>
+        </div>
+      ))}
     </>
   );
 }

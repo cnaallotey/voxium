@@ -9,7 +9,7 @@ import type { D1Database, D1PreparedStatement } from "./d1";
 import type { Env } from "./env";
 import { githubRepoLevel, githubStanding, resolveRole } from "./access";
 import { syncAccess } from "./sign-in";
-import { beginCheck, getRole, getStoredRole, isLatestCheck, listMemberships, listOrgsForUser, listReposForUser, setMembership, upsertOrg, upsertRepos, upsertUser, type UserRow } from "./store";
+import { beginCheck, getSelfApproval, listDecisions, listPeople, saveDecision, saveSelfApproval, setTeamLeader, syncMembership, withdrawSelfApproval, removeRepos, type Decision, getRole, getStoredRole, isLatestCheck, listMemberships, listOrgsForUser, listReposForUser, upsertOrg, upsertRepos, upsertUser, type UserRow } from "./store";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const migrations = path.join(here, "../../migrations");
@@ -17,7 +17,7 @@ const key = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKe
 
 // D1 is SQLite, so run the real migrations and queries. Vite cannot resolve node:sqlite, hence getBuiltinModule.
 type Sqlite = { exec(sql: string): void; prepare(sql: string): { all(...v: unknown[]): unknown[]; run(...v: unknown[]): unknown } };
-function database(files = ["0001_init.sql", "0002_access.sql", "0003_check_runs.sql"]): { db: D1Database; raw: Sqlite } {
+function database(files = ["0001_init.sql", "0002_access.sql", "0003_check_runs.sql", "0004_approvals.sql"]): { db: D1Database; raw: Sqlite } {
   const { DatabaseSync } = (process as any).getBuiltinModule("node:sqlite");
   const raw: Sqlite = new DatabaseSync(":memory:");
   raw.exec("PRAGMA foreign_keys = ON");
@@ -41,6 +41,11 @@ interface World {
   /** "org/login" to membership. */
   members?: Record<string, { id: number; role: string; state?: string }>;
   fail?: string;
+}
+
+/** Put a role on record directly. */
+async function setMembership(to: D1Database, userId: number, orgId: number, role: string): Promise<void> {
+  await to.prepare("INSERT INTO memberships (user_id, org_id, role) VALUES (?, ?, ?) ON CONFLICT(user_id, org_id) DO UPDATE SET role = excluded.role, state = 'active'").bind(userId, orgId, role).run();
 }
 
 function github(w: World) {
@@ -294,13 +299,20 @@ describe("GitHub App credentials", () => {
     const script = path.join(dir, "convert-manifest.mjs");
     fs.copyFileSync(path.join(here, "../../github-app/convert-manifest.mjs"), script);
     const stub = path.join(dir, "stub.mjs");
-    fs.writeFileSync(stub, `globalThis.fetch = async () => new Response(JSON.stringify({ id: 1, slug: "s", client_id: "c", client_secret: "x", webhook_secret: "y", pem: "PEM" }));`);
+    fs.writeFileSync(stub, `globalThis.fetch = async () => new Response(JSON.stringify({ id: 1, slug: "s", client_id: "c", client_secret: "top-a", webhook_secret: "top-b", pem: "PEM\\nKEY\\n" }));`);
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "vx-cwd-"));
-    execFileSync(process.execPath, ["--import", pathToFileURL(stub).href, script, "code12345"], { cwd, stdio: "ignore" });
+    const printed = execFileSync(process.execPath, ["--import", pathToFileURL(stub).href, script, "code12345"], { cwd, stdio: "pipe" }).toString();
     expect(fs.readdirSync(cwd)).toEqual([]);
-    const pem = path.join(dir, "out/private-key.pem");
-    expect(fs.readFileSync(pem, "utf8")).toBe("PEM");
-    expect(fs.statSync(pem).mode & 0o777).toBe(0o600);
+    expect(fs.readdirSync(path.join(dir, "out")).sort()).toEqual(["secrets.json", "vars.env"]);
+    const file = path.join(dir, "out/secrets.json");
+    const secrets = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(secrets).toEqual({
+      GITHUB_CLIENT_SECRET: "top-a", GITHUB_WEBHOOK_SECRET: "top-b", GITHUB_APP_PRIVATE_KEY: "PEM\nKEY\n",
+      SESSION_SECRET: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    expect(fs.readFileSync(path.join(dir, "out/vars.env"), "utf8")).toBe("GITHUB_APP_ID=1\nGITHUB_APP_SLUG=s\nGITHUB_CLIENT_ID=c\n");
+    expect(printed).not.toMatch(new RegExp(`top-|PEM|${secrets.SESSION_SECRET}`));
     expect(fs.readFileSync(path.join(here, "../../.gitignore"), "utf8")).toContain("github-app/out");
   });
 
@@ -330,5 +342,73 @@ describe("GitHub App credentials", () => {
     fs.writeFileSync(fresh, "SESSION_SECRET=change-me-to-a-long-random-string\n");
     run("code12345", "--dev-vars", fresh);
     expect(fs.readFileSync(fresh, "utf8")).toMatch(/SESSION_SECRET=[0-9a-f]{64}/);
+  });
+});
+
+describe("roles on record", () => {
+  const role = async () => getStoredRole(db, user.id, await orgId());
+
+  it("follow GitHub, and keep Team Leader only for members", async () => {
+    const org = await orgId();
+    expect(await syncMembership(db, user.id, org, "outside")).toBe("member");
+    expect(await setTeamLeader(db, user.id, org, true)).toBe(true);
+    expect(await syncMembership(db, user.id, org, "member")).toBe("team_leader");
+    expect(await syncMembership(db, user.id, org, "owner")).toBe("owner");
+    expect(await syncMembership(db, user.id, org, "member")).toBe("member");
+    await setTeamLeader(db, user.id, org, true);
+    expect(await syncMembership(db, user.id, org, "outside")).toBe("member");
+  });
+
+  it("a sign in that overlaps a demotion cannot bring Team Leader back", async () => {
+    const org = await orgId();
+    await syncMembership(db, user.id, org, "member");
+    await setTeamLeader(db, user.id, org, true);
+    expect(await role()).toBe("team_leader"); // what a sign in read before...
+    await setTeamLeader(db, user.id, org, false); // ...the Owner took it away
+    expect(await syncMembership(db, user.id, org, "member")).toBe("member");
+  });
+
+  it("cannot make or unmake an Owner, or a stranger", async () => {
+    const org = await orgId();
+    await syncMembership(db, user.id, org, "owner");
+    expect(await setTeamLeader(db, user.id, org, true)).toBe(false);
+    expect(await setTeamLeader(db, user.id, org, false)).toBe(false);
+    expect(await role()).toBe("owner");
+    const zed = await upsertUser(db, { github_id: 9, login: "zed", name: null, avatar_url: null });
+    expect(await setTeamLeader(db, zed.id, org, true)).toBe(false);
+    expect((await listPeople(db, org)).map((p) => p.login)).toEqual([user.login]);
+  });
+});
+
+describe("approvals and decisions on record", () => {
+  it("an approval is for one commit into one branch, and its giver can take it back", async () => {
+    const org = await orgId();
+    await upsertRepos(db, org, [repo(1, "web")]);
+    const pull = { repoId: 1, number: 4, headSha: "h", baseRef: "main" };
+    await saveSelfApproval(db, pull, user.id, "because");
+    expect(await getSelfApproval(db, pull)).toMatchObject({ github_id: user.github_id, reason: "because" });
+    for (const other of [{ headSha: "x" }, { baseRef: "dev" }, { number: 5 }, { repoId: 2 }]) {
+      expect(await getSelfApproval(db, { ...pull, ...other })).toBeNull();
+    }
+    await saveSelfApproval(db, pull, user.id, "better reason");
+    expect((await getSelfApproval(db, pull))!.reason).toBe("better reason");
+    const zed = await upsertUser(db, { github_id: 9, login: "zed", name: null, avatar_url: null });
+    await withdrawSelfApproval(db, 1, 4, zed.id);
+    expect(await getSelfApproval(db, pull)).not.toBeNull();
+    await withdrawSelfApproval(db, 1, 4, user.id);
+    expect(await getSelfApproval(db, pull)).toBeNull();
+  });
+
+  it("the log cannot be rewritten and outlives the repo being disconnected", async () => {
+    const d: Decision = {
+      github_repo_id: 1, pr_number: 4, kind: "unapproved", title: "T", changes: ["Removes rule X"], reason: null,
+      approved_by: null, merged_by: "ann", head_sha: "h", merged_at: "2026-01-01T00:00:00Z",
+    };
+    await upsertRepos(db, await orgId(), [repo(1, "web")]);
+    await saveDecision(db, d);
+    await saveDecision(db, { ...d, kind: "approved", approved_by: "ann" });
+    await removeRepos(db, [1]);
+    expect(await listDecisions(db, 1)).toMatchObject([d]);
+    expect(await listDecisions(db, 2)).toEqual([]);
   });
 });

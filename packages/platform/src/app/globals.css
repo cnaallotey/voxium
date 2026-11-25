@@ -33,3 +33,4 @@ pre { padding: 12px; overflow: auto; }
 .layers { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
 .layer { background: #0f1218; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
 .error { border-color: var(--bad); color: var(--bad); }
+textarea { display: block; width: 100%; margin: 6px 0 12px; padding: 8px 10px; background: #0f1218; color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: inherit; }

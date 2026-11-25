@@ -32,6 +32,7 @@ export {
   findProtectedChanges,
 } from "./protect.js";
 export type { ProtectedContents } from "./protect.js";
+export { describeRuleChanges } from "./changes.js";
 export {
   getArchitectureSummary,
   getRulesForPath,

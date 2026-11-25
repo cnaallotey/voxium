@@ -10,9 +10,12 @@ export interface WebhookPayload {
     state?: string;
     merged?: boolean;
     html_url?: string;
+    title?: string;
+    merged_by?: { login: string } | null;
+    closed_at?: string | null;
     user: { id: number };
     head: { sha: string };
-    base: { ref: string };
+    base: { ref: string; sha?: string };
   };
   changes?: { base?: unknown };
   review?: { state?: string; user: { id: number } | null };
@@ -61,5 +64,13 @@ export function closedPrFrom(event: string | null, body: WebhookPayload): Closed
     defaultBranch: repository.default_branch,
     merged: pr.merged === true,
     url: pr.html_url ?? null,
+    number: pr.number,
+    title: pr.title ?? `Pull request ${pr.number}`,
+    authorId: pr.user.id,
+    headSha: pr.head.sha,
+    baseSha: pr.base.sha ?? "",
+    baseRef: pr.base.ref,
+    mergedBy: pr.merged_by?.login ?? null,
+    closedAt: pr.closed_at ?? new Date().toISOString(),
   };
 }

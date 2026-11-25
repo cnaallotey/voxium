@@ -33,7 +33,7 @@ How it works: the repo holds the rules (`voxium/architecture.json`). The platfor
 
 ## What stops a PR from getting around the rules
 
-* A PR that changes `voxium/architecture.json`, `voxium/baseline.json` or `.github/workflows/voxium.yml` fails `voxium/rules` until an Owner or Team Leader with write access approves that exact commit in a GitHub review. It is then judged by the rules they approved. If the rules on the base branch changed meanwhile, the branch has to be updated first. Removing baseline debt needs no approval.
+* A PR that changes `voxium/architecture.json`, `voxium/baseline.json` or `.github/workflows/voxium.yml` fails `voxium/rules` until an Owner or Team Leader with write access approves that exact commit in a GitHub review. It is then judged by the rules they approved. A solo owner can approve their own pull request in Voxium instead (see below). If the rules on the base branch changed meanwhile, the branch has to be updated first. Removing baseline debt needs no approval.
 * `voxium/rules` is only ever written by a check against the default branch. PRs into another branch report as `voxium/rules (branch name)`. Require that name if you protect the branch.
 * Files outside every module are followed: importing one counts as importing everything it leads to.
 * Committed files are not skipped because of their folder name. List build output in `ignore` in the architecture file. Ignored files are not judged themselves, but importing one still counts as importing what it leads to.
@@ -55,6 +55,15 @@ GitHub decides, and the platform never grants more than GitHub would.
 * Owner is an admin of the GitHub organization, or the account holder of a personal account. Nobody becomes Owner by signing in first.
 * Roles and the list of repos are refreshed from GitHub at every sign in. Sessions last 8 hours. "Refresh access" on the dashboard does it sooner. Losing sight of an organization (suspended app, no SSO session) takes access away but keeps a Team Leader's role for when it returns. Leaving the organization ends it.
 * Opening a repo page, starting setup and counting an approval each ask GitHub again at that moment. If GitHub cannot answer, access is refused.
+
+## Approving changes to the rules
+
+The `voxium/rules` status links to the pull request's page in Voxium, which says in plain words what the change does to the rules.
+
+* Usually an Owner or Team Leader approves with a GitHub review. An organization's Owners choose Team Leaders on the People page, linked from the dashboard.
+* GitHub does not let anyone approve their own pull request. Someone who is the only member of their organization, or the holder of a personal account, can do it on that page with a written reason. It covers one commit into one base branch. It stops counting when they lose ownership or write access, or when someone joins the organization.
+* Approving takes a signed in browser session on Voxium, so a GitHub token, such as one a coding agent uses, cannot do it.
+* Every merged change to the rules is in the decision log on the repo page: what changed, who approved it and why. Changes that were merged without approval are in it too. **Add to the repository** opens a pull request with the log as files in `voxium/decisions`.
 
 ## Commands
 

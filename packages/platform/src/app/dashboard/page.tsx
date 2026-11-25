@@ -52,7 +52,8 @@ export default async function Dashboard({ searchParams }: { searchParams: Promis
         return (
           <section key={org.id}>
             <h2>
-              {org.account_login} <span className="badge">{org.role.replace("_", " ")}</span>
+              {org.account_login} <span className="badge">{org.role.replace("_", " ")}</span>{" "}
+              {org.role === "owner" && <a className="muted" href={`/orgs/${org.id}`}>People</a>}
             </h2>
             {repos.length === 0 && <p className="muted">No repositories you can open are shared with the app.</p>}
             {repos.map((r) => {

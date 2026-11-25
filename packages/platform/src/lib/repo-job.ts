@@ -3,6 +3,7 @@ import { getEnv, type Env } from "./env";
 import { checkPullRequest, wantFile, type PrCheckOutcome } from "./analysis";
 import { canManage, githubRepoLevel, githubStanding, resolveRole } from "./access";
 import { currentApprovals } from "./approval";
+import { selfApprovalProblem } from "./self-approval";
 import {
   fetchTarball,
   getBranchSha,
@@ -14,7 +15,7 @@ import {
   setCommitStatus,
 } from "./github";
 import { readTarGz } from "./tar";
-import { beginCheck, getOrg, getRepoByGithubId, getRoleByGithubUser, isLatestCheck, saveAnalysis, setRepoSetup, type OrgRow, type RepoRow } from "./store";
+import { beginCheck, getOrg, getRepoByGithubId, getRoleByGithubUser, getSelfApproval, isLatestCheck, saveAnalysis, setRepoSetup, type OrgRow, type RepoRow } from "./store";
 
 export interface PrEvent {
   installationId: number;
@@ -38,42 +39,61 @@ export function statusContext(baseRef: string, defaultBranch: string): string {
   return baseRef === defaultBranch ? "voxium/rules" : `voxium/rules (${baseRef})`;
 }
 
-async function readProtected(token: string, fullName: string, sha: string): Promise<ProtectedContents> {
+export async function readProtected(token: string, fullName: string, sha: string): Promise<ProtectedContents> {
   const entries = await Promise.all(PROTECTED_FILES.map(async (p) => [p, await getFileAtRef(token, fullName, p, sha)] as const));
   return Object.fromEntries(entries);
 }
 
 /** The repo and its org, only when they belong to the installation the event came from. */
-async function knownRepo(env: Env, ev: Pick<PrEvent, "repoId" | "installationId">): Promise<{ repo: RepoRow; org: OrgRow } | null> {
+export async function knownRepo(env: Env, ev: Pick<PrEvent, "repoId" | "installationId">): Promise<{ repo: RepoRow; org: OrgRow } | null> {
   const repo = await getRepoByGithubId(env.DB, ev.repoId);
   const org = repo && (await getOrg(env.DB, repo.org_id));
   return repo && org?.installation_id === ev.installationId ? { repo, org } : null;
 }
 
+export interface Approval {
+  kind: "approved" | "self_approved";
+  login: string;
+  reason: string | null;
+}
+
 /**
- * Login of an Owner or Team Leader, with write access, whose approval covers this exact commit.
+ * An Owner or Team Leader, with write access, whose approval covers this exact commit: from a GitHub review, or for
+ * their own pull request given in Voxium by someone who is alone.
  * Standing and access are asked from GitHub now, so someone who left since signing in cannot approve.
  */
-async function findApprover(env: Env, token: string, ev: PrEvent, known: { org: OrgRow } | null): Promise<string | null> {
+export async function findApprover(
+  env: Env,
+  token: string,
+  ev: Pick<PrEvent, "fullName" | "number" | "headSha" | "baseRef" | "authorId">,
+  known: { repo: RepoRow; org: OrgRow } | null,
+): Promise<Approval | null> {
   if (!known) return null;
   for (const a of currentApprovals(await listReviews(token, ev.fullName, ev.number), ev.headSha, ev.authorId)) {
     const user = { github_id: a.id, login: a.login };
     const stored = await getRoleByGithubUser(env.DB, a.id, known.org.id);
     if (!stored || !canManage(resolveRole(await githubStanding(token, known.org, user), stored))) continue;
     const level = await githubRepoLevel(token, ev.fullName, user);
-    if (level === "write" || level === "admin") return a.login;
+    if (level === "write" || level === "admin") return { kind: "approved", login: a.login, reason: a.reason };
+  }
+  const own = await getSelfApproval(env.DB, { repoId: known.repo.id, number: ev.number, headSha: ev.headSha, baseRef: ev.baseRef });
+  if (own && own.github_id === ev.authorId) {
+    const role = await getRoleByGithubUser(env.DB, own.github_id, known.org.id);
+    if (!(await selfApprovalProblem(token, known.org, ev.fullName, own, role))) {
+      return { kind: "self_approved", login: own.login, reason: own.reason };
+    }
   }
   return null;
 }
 
-interface Rules {
+export interface Rules {
   base: ProtectedContents;
   mergeBase: ProtectedContents;
   head: ProtectedContents;
 }
 
 /** The protected files a PR is about, or null when its base branch is not set up. */
-async function readRules(token: string, ev: PrEvent): Promise<Rules | null> {
+export async function readRules(token: string, ev: Pick<PrEvent, "fullName" | "baseRef" | "headSha">): Promise<Rules | null> {
   // Read the branch itself. The base commit in the event can be older than the current rules.
   const baseSha = await getBranchSha(token, ev.fullName, ev.baseRef);
   const base = await readProtected(token, ev.fullName, baseSha);
@@ -100,7 +120,7 @@ async function reviewMatters(env: Env, token: string, ev: PrEvent, reviewerId: n
  */
 export async function runPullRequestCheck(ev: PrEvent): Promise<void> {
   const env = getEnv();
-  const targetUrl = `${env.APP_URL}/dashboard`;
+  let targetUrl = `${env.APP_URL}/dashboard`;
   const context = statusContext(ev.baseRef, ev.defaultBranch);
 
   let token: string;
@@ -114,7 +134,10 @@ export async function runPullRequestCheck(ev: PrEvent): Promise<void> {
     setCommitStatus(token, ev.fullName, ev.headSha, context, state, text, targetUrl);
 
   let run: number;
+  let known: { repo: RepoRow; org: OrgRow } | null;
   try {
+    known = await knownRepo(env, ev);
+    if (known) targetUrl = `${env.APP_URL}/repos/${known.repo.id}/pulls/${ev.number}`;
     // A review that cannot change anything must not disturb the status that is already there.
     if (ev.reviewerId !== undefined && !(await reviewMatters(env, token, ev, ev.reviewerId))) return;
     run = await beginCheck(env.DB, ev.repoId, ev.headSha, context);
@@ -132,7 +155,6 @@ export async function runPullRequestCheck(ev: PrEvent): Promise<void> {
   };
 
   let outcome: PrCheckOutcome;
-  let known: { repo: RepoRow; org: OrgRow } | null;
   try {
     const rules = await readRules(token, ev);
     if (!rules) return; // repo not set up yet: say nothing
@@ -141,9 +163,9 @@ export async function runPullRequestCheck(ev: PrEvent): Promise<void> {
     const tree = await listTree(token, ev.fullName, ev.headSha);
     const headFiles = await readTarGz(await fetchTarball(token, ev.fullName, ev.headSha), { want: wantFile, expect: tree ?? undefined });
 
-    known = await knownRepo(env, ev);
     const changes = findProtectedChanges(rules.base, rules.mergeBase, rules.head);
-    const approvedBy = changes.length ? await findApprover(env, token, ev, known) : null;
+    const approval = changes.length ? await findApprover(env, token, ev, known) : null;
+    const approvedBy = approval && (approval.kind === "self_approved" ? `${approval.login} (own pull request)` : approval.login);
     outcome = checkPullRequest({ headFiles, treePaths: tree && [...tree.keys()], ...rules, approvedBy });
     if (!(await publish(outcome.state, outcome.description))) return;
   } catch (err) {
@@ -180,6 +202,14 @@ export interface ClosedPr {
   defaultBranch: string;
   merged: boolean;
   url: string | null;
+  number: number;
+  title: string;
+  authorId: number;
+  headSha: string;
+  baseSha: string;
+  baseRef: string;
+  mergedBy: string | null;
+  closedAt: string;
 }
 
 /** Keep a repo's setup status in step with its setup pull request. */

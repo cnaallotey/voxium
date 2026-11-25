@@ -19,7 +19,7 @@ vi.mock("next/navigation", () => ({
   redirect: (to: string) => { throw new Error(`REDIRECT ${to}`); },
 }));
 vi.mock("@/lib/auth", () => ({ currentUser: async () => state.user }));
-vi.mock("@/lib/env", () => ({ getEnv: () => ({ DB: {}, APP_URL: "https://vx.test", GITHUB_APP_SLUG: "vx", VOXIUM_CLI_PACKAGE: state.cli }) }));
+vi.mock("@/lib/env", () => ({ waitUntil: () => {}, getEnv: () => ({ DB: {}, APP_URL: "https://vx.test", GITHUB_APP_SLUG: "vx", VOXIUM_CLI_PACKAGE: state.cli }) }));
 vi.mock("@/lib/access", async (original) => ({
   ...(await original<typeof import("./access")>()),
   githubRepoLevel: async () => state.level,
@@ -46,6 +46,7 @@ vi.mock("@/lib/store", () => ({
   getOrg: async () => ({ id: 9, installation_id: 3 }),
   getRole: async () => state.role,
   listAnalyses: async () => [],
+  listDecisions: async () => [],
   saveAnalysis: async () => {},
   setRepoSetup: async (_db: unknown, _id: number, status: string) => void repoStatus.push(status),
   listOrgsForUser: async () => [],
@@ -58,7 +59,9 @@ const { POST } = await import("../app/api/repos/[id]/setup/route");
 const { default: RepoPage } = await import("../app/repos/[id]/page");
 const { default: Dashboard } = await import("../app/dashboard/page");
 const params = { params: Promise.resolve({ id: "5" }) };
-const setup = async () => new URL((await POST({} as never, params)).headers.get("location")!);
+const page = { ...params, searchParams: Promise.resolve({}) };
+const request = (origin: string | null = "https://vx.test") => ({ headers: new Headers(origin === null ? {} : { origin }) }) as never;
+const setup = async (req = request()) => new URL((await POST(req, params)).headers.get("location")!);
 
 beforeEach(() => {
   opened.length = 0;
@@ -72,7 +75,7 @@ describe("repo page", () => {
   it("opens for someone GitHub lets read the repo", async () => {
     state.level = "read";
     state.role = "member";
-    expect(await RepoPage(params)).toBeTruthy();
+    expect(await RepoPage(page)).toBeTruthy();
   });
 
   it.each([
@@ -81,7 +84,7 @@ describe("repo page", () => {
     ["cannot be checked because GitHub is down", { down: true }],
   ])("stays hidden, even from an Owner role, when the user %s", async (_n, change) => {
     Object.assign(state, { role: "owner" }, change);
-    await expect(RepoPage(params)).rejects.toThrow("NOT_FOUND");
+    await expect(RepoPage(page)).rejects.toThrow("NOT_FOUND");
   });
 });
 
@@ -102,6 +105,11 @@ describe("setup", () => {
   ])("does nothing for someone who is %s", async (_n, change) => {
     Object.assign(state, change);
     await setup();
+    expect(opened).toEqual([]);
+  });
+
+  it.each([null, "null", "https://evil.test", "http://vx.test", "https://vx.test:8443"])("ignores a form sent from %j", async (origin) => {
+    await setup(request(origin));
     expect(opened).toEqual([]);
   });
 

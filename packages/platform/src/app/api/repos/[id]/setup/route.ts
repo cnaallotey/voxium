@@ -5,6 +5,7 @@ import { currentUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
 import { ARCH_FILE_PATH, parseCliPackage } from "@voxium/core";
 import { createSetupPr, fetchTarball, getBranchSha, getFileAtRef, getInstallationToken, listTree } from "@/lib/github";
+import { fromThisSite } from "@/lib/same-origin";
 import { readTarGz } from "@/lib/tar";
 import { audit, getOrg, getRepo, getRole, saveAnalysis, setRepoSetup } from "@/lib/store";
 
@@ -16,8 +17,9 @@ function back(env: { APP_URL: string }, path: string, error?: string) {
   return NextResponse.redirect(url, 303);
 }
 
-export async function POST(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const env = getEnv();
+  if (!fromThisSite(req, env.APP_URL)) return back(env, "/dashboard", "That request did not come from Voxium.");
   const user = await currentUser();
   if (!user) return back(env, "/api/auth/login");
 

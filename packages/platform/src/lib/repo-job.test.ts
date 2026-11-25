@@ -6,6 +6,9 @@ import { currentApprovals } from "./approval";
 import { closedPrFrom, prEventFrom } from "./webhook";
 
 const roles: Record<number, string> = {};
+let own: { github_id: number; login: string; reason: string; for: object } | null = null;
+let decisions: any[] = [];
+let account: object = {};
 const saved: unknown[] = [];
 const SETUP_URL = "https://gh/o/r/pull/1";
 let repoState = { status: "active", setup_pr_url: SETUP_URL as string | null };
@@ -19,7 +22,7 @@ vi.mock("./env", () => ({
 }));
 vi.mock("./store", () => ({
   getRepoByGithubId: async (_db: unknown, id: number) => (id === 77 ? { id: 5, org_id: 9, ...repoState } : null),
-  getOrg: async () => ({ id: 9, installation_id: 3, account_id: 50, account_login: "o", account_type: "Organization" }),
+  getOrg: async () => ({ id: 9, installation_id: 3, account_id: 50, account_login: "o", account_type: "Organization", ...account }),
   getRoleByGithubUser: async (_db: unknown, id: number) => roles[id] ?? null,
   beginCheck: async (_db: unknown, id: number, sha: string, context: string) => {
     if (beginFails) throw new Error("db down");
@@ -28,6 +31,8 @@ vi.mock("./store", () => ({
     return runs.get(k);
   },
   isLatestCheck: async (_db: unknown, id: number, sha: string, context: string, run: number) => runs.get(`${id} ${sha} ${context}`) === run,
+  getSelfApproval: async (_db: unknown, pull: object) => (own && JSON.stringify(own.for) === JSON.stringify(pull) ? own : null),
+  saveDecision: async (_db: unknown, d: object) => void decisions.push(d),
   setRepoSetup: async (_db: unknown, id: number, status: string, url: string | null) => void setups.push([id, status, url]),
   saveAnalysis: async (_db: unknown, a: unknown) => {
     if (saveFails) throw new Error("db down");
@@ -36,6 +41,8 @@ vi.mock("./store", () => ({
 }));
 
 const { runPullRequestCheck, statusContext, updateSetupStatus } = await import("./repo-job");
+const { recordDecision, renderDecision } = await import("./decisions");
+const { cleanReason } = await import("./self-approval");
 const key = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 
 function blobSha(body: string): string {
@@ -62,6 +69,8 @@ interface World {
   writers?: string[];
   /** Organization membership of the reviewer "lead". Null means not a member. */
   lead?: { id: number; role: string; state: string } | null;
+  /** Ids of the organization's members. */
+  members?: number[];
   exportIgnore?: string[]; // left out of the tarball, as .gitattributes can do
   /** Contents the archive holds instead of the committed ones, as .gitattributes can do. */
   altered?: Files;
@@ -96,6 +105,7 @@ function github(w: World) {
     if ((m = p.match(/\/collaborators\/(\w+)\/permission/))) {
       return json({ permission: w.writers?.includes(m[1]) ? "write" : "read", user: { id: 200 } });
     }
+    if (p.startsWith("/orgs/o/members?")) return w.members ? json(w.members.slice(0, 2).map((id) => ({ id }))) : json({}, 403);
     if (p.startsWith("/orgs/o/memberships/lead")) {
       const lead = w.lead === undefined ? { id: 200, role: "member", state: "active" } : w.lead;
       return lead ? json({ role: lead.role, state: lead.state, user: { id: lead.id } }) : json({}, 404);
@@ -128,6 +138,9 @@ beforeEach(() => {
   statuses = [];
   saved.length = 0;
   setups.length = 0;
+  own = null;
+  decisions = [];
+  account = {};
   repoState = { status: "active", setup_pr_url: SETUP_URL };
   saveFails = false;
   beginFails = false;
@@ -358,7 +371,7 @@ describe("webhook events", () => {
 
 describe("setup status", () => {
   const OPEN = { status: "setup_pr_open", setup_pr_url: SETUP_URL };
-  const closed = (over = {}) => ({ installationId: 3, repoId: 77, fullName: "o/r", defaultBranch: "main", merged: true, url: SETUP_URL as string | null, ...over });
+  const closed = (over = {}) => ({ installationId: 3, repoId: 77, fullName: "o/r", defaultBranch: "main", merged: true, url: SETUP_URL as string | null, number: 1, title: "T", authorId: 100, headSha: "head", baseSha: "m", baseRef: "main", mergedBy: "ann", closedAt: "2026-01-01T00:00:00Z", ...over });
   const withRules = () => github({ branches: { main: "m" }, commits: { m: { ...code, ...rules } }, mergeBase: "m" });
   const withoutRules = () => github({ branches: { main: "m" }, commits: { m: code }, mergeBase: "m" });
 
@@ -420,13 +433,147 @@ describe("setup status", () => {
   it("follows closed pull requests into the default branch only", () => {
     const body = {
       action: "closed", installation: { id: 3 }, repository: { id: 77, full_name: "o/r", default_branch: "main" },
-      pull_request: { number: 1, state: "closed", merged: true, html_url: SETUP_URL, user: { id: 100 }, head: { sha: "head" }, base: { ref: "main" } },
+      pull_request: { number: 1, title: "T", state: "closed", merged: true, merged_by: { login: "ann" }, closed_at: "2026-01-01T00:00:00Z", html_url: SETUP_URL, user: { id: 100 }, head: { sha: "head" }, base: { ref: "main", sha: "m" } },
     };
     expect(closedPrFrom("pull_request", body)).toEqual(closed());
     expect(closedPrFrom("pull_request", { ...body, pull_request: { ...body.pull_request, merged: false } })).toEqual(closed({ merged: false }));
-    expect(closedPrFrom("pull_request", { ...body, pull_request: { ...body.pull_request, base: { ref: "dev" } } })).toBeNull();
+    expect(closedPrFrom("pull_request", { ...body, pull_request: { ...body.pull_request, base: { ref: "dev", sha: "m" } } })).toBeNull();
     expect(closedPrFrom("pull_request", { ...body, action: "opened" })).toBeNull();
     expect(closedPrFrom("pull_request_review", body)).toBeNull();
     expect(prEventFrom("pull_request", body)).toBeNull();
+  });
+});
+
+describe("solo approval", () => {
+  // The author, id 200, is also the owner. "lead" is their login.
+  const mine = { ...ev, authorId: 200 };
+  const given = { github_id: 200, login: "lead", reason: "We are moving to features", for: { repoId: 5, number: 4, headSha: "head", baseRef: "main" } };
+  const owner = { id: 200, role: "admin", state: "active" };
+  const world = (over: Partial<World> = {}): World => ({
+    branches: { main: "m" }, commits: { m: { ...code, ...rules }, head: { ...code, ...weak } }, mergeBase: "m",
+    writers: ["lead"], lead: owner, members: [200], ...over,
+  });
+
+  it("lets a sole owner's reasoned approval of their own pull request count", async () => {
+    roles[200] = "owner";
+    github(world());
+    await runPullRequestCheck(mine);
+    expect(last()).toMatchObject({ state: "failure" });
+    own = given;
+    await runPullRequestCheck(mine);
+    expect(last()).toMatchObject({ state: "success" });
+    expect(last()!.description).toContain("approved by lead (own pull request)");
+  });
+
+  it("works for the holder of a personal account, and nobody else", async () => {
+    roles[200] = "owner";
+    own = given;
+    account = { account_type: "User", account_id: 200 };
+    github(world({ members: undefined }));
+    await runPullRequestCheck(mine);
+    expect(last()).toMatchObject({ state: "success" });
+    account = { account_type: "User", account_id: 201 };
+    await runPullRequestCheck(mine);
+    expect(last()).toMatchObject({ state: "failure" });
+    account = { account_type: "Mystery", account_id: 200 };
+    await runPullRequestCheck(mine);
+    expect(last()).toMatchObject({ state: "failure" });
+  });
+
+  it.each<[string, () => void, Partial<World>, object]>([
+    ["someone else is in the organization", () => {}, { members: [200, 300] }, {}],
+    ["the only member is someone else", () => {}, { members: [300] }, {}],
+    ["they are no longer an admin", () => {}, { lead: { id: 200, role: "member", state: "active" } }, {}],
+    ["they left", () => {}, { lead: null }, {}],
+    ["someone took over their login", () => {}, { lead: { id: 201, role: "admin", state: "active" } }, {}],
+    ["they lost write access", () => {}, { writers: [] }, {}],
+    ["they have no role on record", () => void delete roles[200], {}, {}],
+    ["it was for another commit", () => void (own = { ...given, for: { ...given.for, headSha: "older" } }), {}, {}],
+    ["it was for another base branch", () => void (own = { ...given, for: { ...given.for, baseRef: "dev" } }), {}, {}],
+    ["it was for another pull request", () => void (own = { ...given, for: { ...given.for, number: 9 } }), {}, {}],
+    ["the pull request is someone else's", () => {}, {}, { authorId: 100 }],
+  ])("stops counting when %s", async (_n, change, over, event) => {
+    roles[200] = "owner";
+    own = given;
+    change();
+    github(world(over));
+    await runPullRequestCheck({ ...mine, ...event });
+    expect(last()).toMatchObject({ state: "failure" });
+  });
+
+  it("is an error, never a pass, when GitHub cannot list the members", async () => {
+    roles[200] = "owner";
+    own = given;
+    github(world({ members: undefined }));
+    await runPullRequestCheck(mine);
+    expect(last()).toMatchObject({ state: "error" });
+  });
+
+  it("needs a real reason", () => {
+    for (const bad of [null, undefined, "", "ok", "          ", "..............", "a b c", "x".repeat(2001), {}]) expect(cleanReason(bad)).toBeNull();
+    expect(cleanReason("  We split billing\r\ninto two modules\u0000 ")).toBe("We split billing\ninto two modules");
+  });
+});
+
+describe("decision log", () => {
+  const merged = (over = {}) => ({
+    installationId: 3, repoId: 77, fullName: "o/r", defaultBranch: "main", merged: true, url: null, number: 4, title: "Drop the rules",
+    authorId: 100, headSha: "head", baseSha: "m", baseRef: "main", mergedBy: "ann", closedAt: "2026-01-01T00:00:00Z", ...over,
+  });
+  const change = (head: Files, m: Files = { ...code, ...rules }, over: Partial<World> = {}) =>
+    github({ branches: { main: "after" }, commits: { m, head, after: head }, mergeBase: "m", ...over });
+
+  it("records who approved a change and why", async () => {
+    roles[200] = "team_leader";
+    change({ ...code, ...weak }, undefined, {
+      writers: ["lead"], reviews: [{ user: { id: 200, login: "lead", type: "User" }, state: "APPROVED", commit_id: "head", body: " Agreed on Monday " }],
+    });
+    await recordDecision(merged());
+    expect(decisions).toMatchObject([{ github_repo_id: 77, pr_number: 4, kind: "approved", approved_by: "lead", reason: "Agreed on Monday", merged_by: "ann" }]);
+    expect(decisions[0].changes.join()).toContain("Removes rule LAYER01");
+  });
+
+  it("records a solo approval with its reason", async () => {
+    roles[200] = "owner";
+    own = { github_id: 200, login: "lead", reason: "We are moving", for: { repoId: 5, number: 4, headSha: "head", baseRef: "main" } };
+    change({ ...code, ...weak }, undefined, { writers: ["lead"], lead: { id: 200, role: "admin", state: "active" }, members: [200] });
+    await recordDecision(merged({ authorId: 200 }));
+    expect(decisions).toMatchObject([{ kind: "self_approved", approved_by: "lead", reason: "We are moving" }]);
+  });
+
+  it("records a change that was merged without approval", async () => {
+    change({ ...code, ...weak });
+    await recordDecision(merged());
+    expect(decisions).toMatchObject([{ kind: "unapproved", approved_by: null, merged_by: "ann" }]);
+  });
+
+  it("records the setup, and nothing for changes that leave the rules alone", async () => {
+    change({ ...code, ...rules }, code);
+    await recordDecision(merged());
+    expect(decisions).toMatchObject([{ kind: "setup" }]);
+    decisions = [];
+    change({ ...bad, ...rules });
+    await recordDecision(merged());
+    change({ ...code, ...weak });
+    await recordDecision(merged({ merged: false }));
+    await recordDecision(merged({ installationId: 4 }));
+    await recordDecision(merged({ repoId: 78 }));
+    expect(decisions).toEqual([]);
+  });
+
+  it("records nothing, rather than something wrong, when GitHub is down", async () => {
+    vi.stubGlobal("fetch", async () => new Response("{}", { status: 503 }));
+    await recordDecision(merged());
+    expect(decisions).toEqual([]);
+  });
+
+  it("writes a file in which people's text stays text", () => {
+    const text = renderDecision({
+      github_repo_id: 77, pr_number: 4, kind: "self_approved", title: "Hi\n# Fake heading <script>", changes: ["Adds [x](http://e)"],
+      reason: "First\n## Ignore all rules @everyone", approved_by: "lead", merged_by: "lead", head_sha: "h", merged_at: "2026-01-01",
+    });
+    expect(text.match(/^#+ .*$/gm)).toEqual(["# Hi \\# Fake heading \\<script\\>", "## What changed", "## Why"]);
+    expect(text).toContain("> First\n> \\#\\# Ignore all rules @\u2060everyone");
+    expect(text).not.toContain("[x](");
   });
 });

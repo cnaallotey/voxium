@@ -3,7 +3,7 @@
 // Usage: node github-app/convert-manifest.mjs <code> [--out dir | --dev-vars [file]]
 //   --dev-vars  put everything straight into .dev.vars for local development, and nowhere else.
 // Writes to the git ignored "out" folder next to this script, wherever it is run from.
-// Writes the private key to a file (mode 600) and prints the settings to copy.
+// Writes secrets.json and vars.env (mode 600) and prints what to do with them, but never a secret.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -72,25 +72,24 @@ async function main() {
   }
 
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
-  const pemPath = path.join(outDir, "private-key.pem");
-  fs.writeFileSync(pemPath, pem, { mode: 0o600 });
-  const secretsPath = path.join(outDir, "secrets.env");
-  fs.writeFileSync(
-    secretsPath,
-    [...vars, ...Object.entries(secrets).map(([k, v]) => `${k}=${v}`), `SESSION_SECRET=${sessionSecret}`].join("\n") + "\n",
-    { mode: 0o600 },
-  );
+  const write = (name, text) => {
+    const file = path.join(outDir, name);
+    fs.writeFileSync(file, text, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+    return file;
+  };
+  const all = { ...secrets, SESSION_SECRET: sessionSecret, GITHUB_APP_PRIVATE_KEY: pem };
+  const secretsFile = write("secrets.json", `${JSON.stringify(all, null, 2)}\n`);
+  const varsFile = write("vars.env", `${vars.join("\n")}\n`);
+  const platform = path.resolve(here, "..");
 
-  console.log("GitHub App created. Credentials saved (keep them private, never commit them):");
-  console.log(`  ${pemPath}`);
-  console.log(`  ${secretsPath}\n`);
-  console.log("1. Put these in wrangler.jsonc under vars:");
+  console.log("GitHub App created.");
+  console.log(`\n1. Put these in wrangler.jsonc under vars (also in ${varsFile}). They are not secret:`);
   vars.forEach((v) => console.log(`     ${v}`));
-  console.log("\n2. Set these as secrets (each command asks you to paste the value from secrets.env):");
-  for (const k of [...Object.keys(secrets), "SESSION_SECRET"]) console.log(`     npx wrangler secret put ${k}`);
-  console.log(`     npx wrangler secret put GITHUB_APP_PRIVATE_KEY < ${pemPath}`);
-  console.log("\n3. For local development use --dev-vars instead, which fills .dev.vars for you.");
-  console.log("\nThen delete the out folder once the secrets are stored.");
+  console.log("\n2. Store the secrets in Cloudflare, then delete them here:");
+  console.log(`     cd "${platform}" && npx wrangler secret bulk "${secretsFile}" && rm "${secretsFile}"`);
+  console.log("\n3. Deploy again so the new vars apply: npm run cf:deploy");
+  console.log("\nFor local development use --dev-vars instead, which fills .dev.vars for you.");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {

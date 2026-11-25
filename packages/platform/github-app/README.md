@@ -2,7 +2,7 @@
 
 You need a public URL first, because GitHub sends webhooks to it.
 
-* Production: deploy once with `npm run cf:deploy` and use the `*.workers.dev` URL (or your own domain).
+* Production: do step 3 first, then use the `*.workers.dev` URL (or your own domain).
 * Local testing: run `npm run cf:preview -- --port 3000` and, in another terminal, `cloudflared tunnel --url http://localhost:3000`. Use `http://localhost:3000` as your URL and the tunnel as the webhook URL. A quick tunnel gets a new address every time, so update the webhook URL in the app settings on GitHub when you restart it. Sign in keeps working without a tunnel.
 
 ## 1. Create the app
@@ -18,18 +18,19 @@ Permissions requested: Contents (write), Pull requests (write), Commit statuses 
 
     node packages/platform/github-app/convert-manifest.mjs <code>
 
-This writes `private-key.pem` and `secrets.env` to `packages/platform/github-app/out` (both mode 600, git ignored, wherever you run it from) and prints the next steps:
+This writes `secrets.json` and `vars.env` to `packages/platform/github-app/out` (both mode 600, git ignored, wherever you run it from) and prints the next steps:
 
 * Put `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_CLIENT_ID` in `wrangler.jsonc` under `vars`. Set `APP_URL` to your URL.
-* Store the rest as secrets with `npx wrangler secret put NAME`.
+* Store the rest with the `npx wrangler secret bulk` command it prints, which also deletes `secrets.json`. Then deploy again so the new vars apply.
 * For local dev add `--dev-vars` to the command. It writes everything to `.dev.vars` and nothing to `out`. Restart Voxium afterwards.
-* Delete `github-app/out` once the secrets are stored.
 
 ## 3. Create the database and deploy
 
     npx wrangler d1 create voxium          # put the id in wrangler.jsonc
     npm run db:migrate:remote
     npm run cf:deploy
+
+The Workers Paid plan is needed. A check of even a small repo takes more than the 10 ms of processor time the free plan allows. `limits` in `wrangler.jsonc` makes the deploy fail on the free plan, instead of every check failing later.
 
 ## 4. Try it end to end
 
@@ -38,7 +39,7 @@ This writes `private-key.pem` and `secrets.env` to `packages/platform/github-app
 3. Back on the dashboard, click **Set up Voxium** on the repo. A pull request appears with the architecture file, baseline and agent rules (and, once `VOXIUM_CLI_PACKAGE` is set, the CI workflow and MCP config).
 4. Review `voxium/architecture.json` and merge.
 5. Open a pull request that breaks a layer rule. A `voxium/rules` status appears on it within a few seconds and fails with the rule names. Open the repo page on the dashboard to see the check result.
-6. In the PR, edit `voxium/architecture.json` to weaken a rule. The check fails and asks for Team Leader approval, whatever the code looks like. Approve the PR from another account that is an Owner or Team Leader and has write access, and it is checked again by the new rules.
+6. In the PR, edit `voxium/architecture.json` to weaken a rule. The check fails and asks for Team Leader approval, whatever the code looks like. Approve the PR from another account that is an Owner or Team Leader and has write access, or, when you are alone, follow the status to its page in Voxium and approve it there with a reason. It is checked again by the new rules.
 
 ## 5. Make it required
 

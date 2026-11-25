@@ -6,12 +6,18 @@
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
   "observability": { "enabled": true },
+  // Old versions must not stay reachable on their own addresses.
+  "preview_urls": false,
+  // Needs the Workers Paid plan. A check takes longer than the 10 ms the free plan allows.
+  "limits": { "cpu_ms": 30000 },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "voxium",
-      // All zeros works for local dev. Replace with the id from "wrangler d1 create voxium" before deploying.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // From "wrangler d1 create voxium". Use your own when you deploy to another account.
+      "database_id": "4c1869f3-d29d-4d67-bf50-b8ebb3121e41",
+      // Local development keeps its own database.
+      "preview_database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
   ],
