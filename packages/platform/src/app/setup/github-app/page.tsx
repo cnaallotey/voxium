@@ -1,4 +1,5 @@
 import { getEnv } from "@/lib/env";
+import { Notice, PageHeader } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
@@ -9,7 +10,7 @@ export default async function GithubAppCreated({ searchParams }: { searchParams:
   const local = /^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(getEnv().APP_URL);
   return (
     <>
-      <h1>GitHub App created</h1>
+      <PageHeader title="GitHub App created" />
       {safe ? (
         <>
           <p className="lead">
@@ -26,7 +27,7 @@ export default async function GithubAppCreated({ searchParams }: { searchParams:
           </p>
         </>
       ) : (
-        <p className="lead">No valid code in the address. Create the app again from the setup page.</p>
+        <Notice tone="error">No valid code in the address. Create the app again from the setup page.</Notice>
       )}
     </>
   );

@@ -5,34 +5,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { D1Database, D1PreparedStatement } from "./d1";
+import type { D1Database } from "./d1";
 import type { Env } from "./env";
 import { githubRepoLevel, githubStanding, resolveRole } from "./access";
 import { syncAccess } from "./sign-in";
+import { database, migrations } from "./test-db";
 import { beginCheck, getSelfApproval, listDecisions, listPeople, saveDecision, saveSelfApproval, setTeamLeader, syncMembership, withdrawSelfApproval, removeRepos, type Decision, getRole, getStoredRole, isLatestCheck, listMemberships, listOrgsForUser, listReposForUser, upsertOrg, upsertRepos, upsertUser, type UserRow } from "./store";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const migrations = path.join(here, "../../migrations");
 const key = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-
-// D1 is SQLite, so run the real migrations and queries. Vite cannot resolve node:sqlite, hence getBuiltinModule.
-type Sqlite = { exec(sql: string): void; prepare(sql: string): { all(...v: unknown[]): unknown[]; run(...v: unknown[]): unknown } };
-function database(files = ["0001_init.sql", "0002_access.sql", "0003_check_runs.sql", "0004_approvals.sql"]): { db: D1Database; raw: Sqlite } {
-  const { DatabaseSync } = (process as any).getBuiltinModule("node:sqlite");
-  const raw: Sqlite = new DatabaseSync(":memory:");
-  raw.exec("PRAGMA foreign_keys = ON");
-  for (const f of files) raw.exec(fs.readFileSync(path.join(migrations, f), "utf8"));
-  const statement = (sql: string, values: unknown[] = []): D1PreparedStatement => ({
-    bind: (...v) => statement(sql, v),
-    first: async <T,>() => (raw.prepare(sql).all(...values)[0] as T) ?? null,
-    all: async <T,>() => ({ results: raw.prepare(sql).all(...values) as T[], meta: {} }),
-    run: async () => {
-      raw.prepare(sql).run(...values);
-      return { results: [], meta: {} };
-    },
-  });
-  return { raw, db: { prepare: (sql) => statement(sql), batch: async (list) => Promise.all(list.map((s) => s.run())) } };
-}
 
 interface Repo { id: number; full_name: string; default_branch: string; private: boolean; permissions?: object }
 interface Install { id: number; app_id?: number; suspended_at?: string | null; account: { id: number; login: string; type: string }; repos: Repo[] }

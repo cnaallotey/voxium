@@ -13,8 +13,8 @@ export interface WebhookPayload {
     title?: string;
     merged_by?: { login: string } | null;
     closed_at?: string | null;
-    user: { id: number };
-    head: { sha: string };
+    user: { id: number; login?: string };
+    head: { sha: string; ref?: string };
     base: { ref: string; sha?: string };
   };
   changes?: { base?: unknown };
@@ -46,8 +46,10 @@ export function prEventFrom(event: string | null, body: WebhookPayload): PrEvent
     defaultBranch: repository.default_branch,
     number: pr.number,
     authorId: pr.user.id,
+    ...(pr.user.login ? { authorLogin: pr.user.login } : {}),
     headSha: pr.head.sha,
     baseRef: pr.base.ref,
+    ...(pr.head.ref ? { headRef: pr.head.ref } : {}),
     ...(event === "pull_request_review" ? { reviewerId: body.review!.user!.id } : {}),
   };
 }

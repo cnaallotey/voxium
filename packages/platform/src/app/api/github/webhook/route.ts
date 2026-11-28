@@ -1,9 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { verifyWebhookSignature } from "@/lib/crypto";
 import { getEnv, waitUntil } from "@/lib/env";
-import { recordDecision } from "@/lib/decisions";
+import { recordDecision, recordReopened } from "@/lib/decisions";
 import { getInstallationToken, listInstallationRepos } from "@/lib/github";
 import { runPullRequestCheck, updateSetupStatus } from "@/lib/repo-job";
+import { runSnapshot } from "@/lib/snapshot-job";
 import { closedPrFrom, prEventFrom, type WebhookPayload } from "@/lib/webhook";
 import { deleteOrgByInstallation, getOrgByInstallation, removeRepos, upsertOrg, upsertRepos } from "@/lib/store";
 
@@ -48,6 +49,7 @@ export async function POST(req: NextRequest) {
 
   const prEvent = prEventFrom(event, body);
   if (prEvent) {
+    if (event === "pull_request" && body.action === "reopened") waitUntil(recordReopened(prEvent));
     waitUntil(runPullRequestCheck(prEvent));
     return NextResponse.json({ ok: true, queued: true }, { status: 202 });
   }
@@ -56,6 +58,8 @@ export async function POST(req: NextRequest) {
   if (closed) {
     waitUntil(updateSetupStatus(closed));
     waitUntil(recordDecision(closed));
+    // The default branch has new code: what it is like now goes into its history.
+    if (closed.merged) waitUntil(runSnapshot(closed));
     return NextResponse.json({ ok: true, queued: true }, { status: 202 });
   }
 

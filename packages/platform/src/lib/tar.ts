@@ -97,6 +97,8 @@ export interface ReadTarOptions {
    * .gitattributes can make an archive differ from the commit (export-subst, working-tree-encoding).
    */
   expect?: ReadonlyMap<string, string>;
+  /** Files kept apart, with their own size limit, so that they never take the room of the files above. */
+  extra?: { want: (path: string) => boolean; maxFileBytes: number; into: Record<string, string> };
 }
 
 async function blobHash(data: Uint8Array, algorithm: "SHA-1" | "SHA-256"): Promise<string> {
@@ -170,7 +172,17 @@ export async function readTarGz(
 
     const isFile = type === "0" || type === "7";
     const rel = fullName.split("/").slice(1).join("/"); // drop "<repo>-<sha>/"
-    if (isFile && rel && size <= maxFile && kept + size <= maxKept && opts.want(rel)) {
+    const extra = opts.extra;
+    if (isFile && rel && extra?.want(rel)) {
+      if (size > extra.maxFileBytes) {
+        await reader.skip(padded);
+        continue;
+      }
+      const body = await reader.take(padded);
+      if (!body) break;
+      const data = opts.expect ? await asCommitted(body.subarray(0, size), opts.expect.get(rel)) : body.subarray(0, size);
+      if (data) extra.into[rel] = dec.decode(data);
+    } else if (isFile && rel && size <= maxFile && kept + size <= maxKept && opts.want(rel)) {
       const body = await reader.take(padded);
       if (!body) break;
       const raw = body.subarray(0, size);

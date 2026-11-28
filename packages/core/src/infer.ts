@@ -1,7 +1,7 @@
-import { assignModules, checkArchitecture, moduleDependencies } from "./check.js";
-import { matchesAny } from "./glob.js";
-import { IGNORE_DIRS } from "./graph.js";
-import type { Architecture, InferResult, ProjectGraph } from "./types.js";
+import { assignModules, checkArchitecture, graphNodes, moduleDependencies } from "./check.js";
+import { compileGlobs } from "./glob.js";
+import { IGNORE_DIRS, isSourcePath } from "./graph.js";
+import type { Architecture, CheckResult, InferProposal, InferResult, ProjectGraph, Rule } from "./types.js";
 
 const GROUP_DIRS = new Set(["features", "modules", "domains", "packages", "apps", "services"]);
 /** Folders that hold tests, demos or tooling rather than application architecture. */
@@ -13,7 +13,8 @@ const NOT_MODULES = new Set([
 const PIN_TOP =new Set(["app", "pages", "routes", "views", "screens", "cli", "bin", "main", "ui"]);
 const PIN_BOTTOM = new Set(["shared", "utils", "util", "lib", "libs", "common", "types", "constants", "config"]);
 
-function sanitize(name: string): string {
+/** A module name made of lower case letters, digits and "_". */
+export function sanitize(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "module";
 }
 
@@ -78,18 +79,179 @@ export function detectBuildOutput(paths: string[]): string[] {
   return [...[...onlyJs].filter(([, js]) => js).map(([dir]) => `${dir}/**`), ...pnp].sort();
 }
 
-/** "unread" lists files in the graph whose contents could not be read. They are proposed as ignored too. */
-export function inferArchitecture(graph: ProjectGraph, opts: { unread?: string[] } = {}): InferResult {
+/** What a layers rule says when Voxium wrote it for this order. */
+export function layersDescription(layers: string[]): string {
+  return `Modules may only import from their own module or from modules lower in the layer order: ${layers.join(" > ")}.`;
+}
+
+/** The rules init and setup propose for any architecture: layers in the given order, no cycles, no opaque imports, file size. */
+export function defaultRules(layers: string[]): Rule[] {
+  return [
+    {
+      id: "LAYER01",
+      type: "layers",
+      severity: "block",
+      description: layersDescription(layers),
+      rationale: "A fixed dependency direction keeps lower layers reusable and stops circular knowledge between areas of the app.",
+    },
+    {
+      id: "CYCLE01",
+      type: "no_cycles",
+      severity: "block",
+      description: "Modules must not depend on each other in a cycle.",
+      rationale: "Cycles make modules impossible to change, test or extract on their own.",
+    },
+    {
+      id: "OPAQUE01",
+      type: "no_opaque_imports",
+      severity: "warn",
+      description: "Code must not load modules in a way that hides which ones, such as import() of a variable.",
+      rationale: "What cannot be told from the code cannot be checked, so such an import can break any other rule unnoticed.",
+    },
+    {
+      id: "SIZE01",
+      type: "max_file_lines",
+      max: 600,
+      severity: "warn",
+      description: "Source files should stay under 600 lines.",
+      rationale: "Very large files usually mix responsibilities and are hard for humans and agents to change safely.",
+    },
+  ];
+}
+
+/** Frameworks a package.json depends on, by the name Voxium gives them, in a fixed order. Null when it is not readable. */
+export function detectFrameworks(packageJson: string): string[] | null {
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(packageJson);
+  } catch {
+    return null;
+  }
+  if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) return null;
+  const deps = new Set<string>();
+  for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+    const list = (pkg as Record<string, unknown>)[field];
+    if (list && typeof list === "object") for (const name of Object.keys(list)) deps.add(name);
+  }
+  return FRAMEWORKS.filter(([, names]) => names.some((n) => deps.has(n))).map(([name]) => name);
+}
+
+const FRAMEWORKS: Array<[string, string[]]> = [
+  ["next", ["next"]],
+  ["nuxt", ["nuxt", "nuxt3", "nuxt-nightly"]],
+  ["express", ["express"]],
+  ["nest", ["@nestjs/core"]],
+  ["vite", ["vite"]],
+];
+/** Frameworks that have a template of their own. */
+const FRAMEWORK_TEMPLATES = new Set(["next", "nuxt"]);
+
+const round = (n: number) => Math.round(Math.max(0, Math.min(1, n)) * 100) / 100;
+/** A module with this many files or more is as certain as a module can be. */
+const SURE_FILES = 10;
+
+/**
+ * How well the code supports each module, layer and rule of an architecture: the files a module has, the share of the
+ * imports between a layer and the others that go down the order, and the share of files a rule finds nothing wrong with.
+ */
+export function rateArchitecture(arch: Architecture, graph: ProjectGraph, result: CheckResult = checkArchitecture(arch, graph)): InferProposal[] {
+  const modOf = assignModules(arch, graphNodes(graph));
+  const counts = new Map<string, number>();
+  for (const f of graph.files) {
+    const m = modOf.get(f);
+    if (m !== undefined) counts.set(m, (counts.get(m) ?? 0) + 1);
+  }
+  const pos = new Map(arch.layers.map((m, i) => [m, i]));
+  const weights = new Map<string, number>();
+  for (const d of moduleDependencies(graph, modOf)) {
+    if (!d.toMod || d.toMod === d.fromMod || !pos.has(d.fromMod) || !pos.has(d.toMod)) continue;
+    const k = `${d.fromMod}>${d.toMod}`;
+    weights.set(k, (weights.get(k) ?? 0) + 1);
+  }
+  const share = (match: (from: string, to: string) => boolean) => {
+    let total = 0;
+    let down = 0;
+    for (const [k, w] of weights) {
+      const [a, b] = k.split(">");
+      if (!match(a, b)) continue;
+      total += w;
+      if (pos.get(a)! < pos.get(b)!) down += w;
+    }
+    return { total, down };
+  };
+
+  const out: InferProposal[] = [];
+  for (const [name, def] of Object.entries(arch.modules)) {
+    const n = counts.get(name) ?? 0;
+    out.push({
+      kind: "module",
+      name,
+      confidence: round(n / SURE_FILES),
+      evidence: n ? `${n} source file(s) match ${def.paths.join(", ")}.` : `No source file matches ${def.paths.join(", ")}.`,
+    });
+  }
+  for (const name of arch.layers) {
+    const { total, down } = share((a, b) => a === name || b === name);
+    out.push({
+      kind: "layer",
+      name,
+      confidence: total ? round(down / total) : 0.5,
+      evidence: total
+        ? `${down} of ${total} import(s) between ${name} and other layers go down the order.`
+        : `No imports between ${name} and other layers, so its place in the order is a guess.`,
+    });
+  }
+  const assigned = [...counts.values()].reduce((a, b) => a + b, 0);
+  for (const rule of arch.rules) {
+    const found = result.violations.filter((v) => v.ruleId === rule.id);
+    const files = new Set(found.map((v) => v.file)).size;
+    const now = found.length ? `${found.length} violation(s) in ${files} file(s) of the current code` : "No violations in the current code";
+    let confidence = assigned ? 1 - files / assigned : found.length ? 0 : 1;
+    let evidence = `${now}.`;
+    if (rule.type === "layers") {
+      const { total, down } = share(() => true);
+      confidence = total ? down / total : 0.5;
+      evidence = `${down} of ${total} import(s) between layers go down the order. ${now}.`;
+    } else if (rule.type === "no_cycles") {
+      const inCycles = new Set(found.flatMap((v) => result.cycles.get(v.id)?.modules ?? []));
+      const modules = Object.keys(arch.modules).length;
+      confidence = modules ? 1 - inCycles.size / modules : 1;
+      evidence = inCycles.size ? `${inCycles.size} of ${modules} module(s) are in a cycle now.` : "No modules depend on each other in a cycle now.";
+    }
+    out.push({ kind: "rule", name: rule.id, confidence: round(confidence), evidence });
+  }
+  return out;
+}
+
+/**
+ * "unread" lists files in the graph whose contents could not be read. They are proposed as ignored too, as are those that
+ * could not be read to their end. "packageJson" is the root package.json, to name the frameworks it uses in a note.
+ */
+export function inferArchitecture(graph: ProjectGraph, opts: { unread?: string[]; packageJson?: string | null } = {}): InferResult {
   const notes: string[] = [];
+  const frameworks = typeof opts.packageJson === "string" ? detectFrameworks(opts.packageJson) : [];
+  if (frameworks === null) notes.push("The root package.json could not be read, so no framework was detected.");
+  else if (frameworks.length) {
+    const templates = frameworks.filter((f) => FRAMEWORK_TEMPLATES.has(f));
+    const offer = templates.length ? ` A template fits it: ${templates.join(", ")}.` : "";
+    notes.push(`package.json uses ${frameworks.join(", ")}.${offer}`);
+  }
   const output = detectBuildOutput(graph.files);
-  const unread = (opts.unread ?? []).filter((p) => !matchesAny(p, output));
+  const isOutput = compileGlobs(output);
+  // A config file that cannot be read is not proposed as ignored: that would drop what it says without a word.
+  const unread = [...(opts.unread ?? []), ...graph.unparsed.map((u) => u.file).filter(isSourcePath)].filter((p) => !isOutput(p));
   const ignore = [...output, ...unread];
-  const files = graph.files.filter((f) => !matchesAny(f, ignore));
+  const isIgnored = compileGlobs(ignore);
+  const files = graph.files.filter((f) => !isIgnored(f));
+  if (graph.aliases && Object.keys(graph.aliases).length) {
+    notes.push(`Module names from the root tsconfig and workspace were written to "aliases", so a change to those files cannot hide imports: ${Object.keys(graph.aliases).slice(0, 10).join(", ")}${Object.keys(graph.aliases).length > 10 ? ", ..." : ""}.`);
+  }
+  notes.push(...(graph.notes ?? []).map((n) => `${n}.`));
   if (output.length) {
     notes.push(`Treated as build output or tooling and not checked: ${output.join(", ")}. Remove from "ignore" if any of it is source code.`);
   }
   if (unread.length) {
-    notes.push(`Could not be read and not checked: ${unread.join(", ")}. Nothing in the checked code imports them today.`);
+    notes.push(`Could not be read and not checked: ${unread.join(", ")}. If checked code imports one of them, the check is an error.`);
   }
   const srcRoot = pickSourceRoot(files);
   const prefix = srcRoot ? `${srcRoot}/` : "";
@@ -148,10 +310,11 @@ export function inferArchitecture(graph: ProjectGraph, opts: { unread?: string[]
     rules: [],
     exceptions: [],
     ...(ignore.length ? { ignore } : {}),
+    ...(graph.aliases && Object.keys(graph.aliases).length ? { aliases: graph.aliases } : {}),
   };
 
   // Module edges from the import graph.
-  const modOf = assignModules(draft, graph.files);
+  const modOf = assignModules(draft, graphNodes(graph));
   const weights = new Map<string, number>();
   for (const d of moduleDependencies(graph, modOf)) {
     if (!d.toMod) continue;
@@ -172,30 +335,7 @@ export function inferArchitecture(graph: ProjectGraph, opts: { unread?: string[]
   }
   const confidence = total === 0 ? (Object.keys(modules).length ? 0.5 : 0) : consistent / total;
 
-  draft.rules = [
-    {
-      id: "LAYER01",
-      type: "layers",
-      severity: "block",
-      description: `Modules may only import from their own module or from modules lower in the layer order: ${layers.join(" > ")}.`,
-      rationale: "A fixed dependency direction keeps lower layers reusable and stops circular knowledge between areas of the app.",
-    },
-    {
-      id: "CYCLE01",
-      type: "no_cycles",
-      severity: "block",
-      description: "Modules must not depend on each other in a cycle.",
-      rationale: "Cycles make modules impossible to change, test or extract on their own.",
-    },
-    {
-      id: "SIZE01",
-      type: "max_file_lines",
-      max: 600,
-      severity: "warn",
-      description: "Source files should stay under 600 lines.",
-      rationale: "Very large files usually mix responsibilities and are hard for humans and agents to change safely.",
-    },
-  ];
+  draft.rules = defaultRules(layers);
 
   const result = checkArchitecture(draft, graph);
   const existing = result.violations.filter((v) => v.severity === "block");
@@ -212,10 +352,17 @@ export function inferArchitecture(graph: ProjectGraph, opts: { unread?: string[]
       "Modules with no imports between them are ordered arbitrarily. If you expect one to depend on another later, check that it sits above it in the layer order.",
     );
   }
-  const unassigned = files.length - modOf.size;
+  const unassigned = files.filter((f) => !modOf.has(f)).length;
   if (unassigned > 0) {
     notes.push(`${unassigned} file(s) sit outside any module (for example root level files) and are not checked themselves. Importing one counts as importing everything it leads to.`);
   }
 
-  return { architecture: draft, confidence, notes, existingViolations: existing.length };
+  return {
+    architecture: draft,
+    confidence,
+    notes,
+    existingViolations: existing.length,
+    proposals: rateArchitecture(draft, graph, result),
+    frameworks: frameworks ?? [],
+  };
 }

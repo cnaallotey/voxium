@@ -1,12 +1,15 @@
-import { describeRuleChanges, findProtectedChanges } from "@voxium/core";
+import { describeRuleChanges } from "@voxium/core";
 import { notFound, redirect } from "next/navigation";
 import { currentUser } from "@/lib/auth";
 import { getPull } from "@/lib/github";
 import { openRepo } from "@/lib/open-repo";
-import { findApprover, readRules } from "@/lib/repo-job";
+import { proposalApprovalProblem } from "@/lib/proposals";
+import { findApprover, findRuleChanges, readRules } from "@/lib/repo-job";
 import { MAX_REASON, selfApprovalProblem } from "@/lib/self-approval";
-import { getSelfApproval, listAnalyses } from "@/lib/store";
-import type { PrCheckOutcome } from "@/lib/analysis-types";
+import { getProposalByPr, getSelfApproval, getPrCheck } from "@/lib/store";
+import type { StoredOutcome } from "@/lib/analysis-types";
+
+import { ErrorNotice, Notice, PageHeader, StateBadge } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
@@ -27,38 +30,82 @@ export default async function PullPage({ params, searchParams }: Props) {
 
   const commit = { repoId: repo.id, number: pull.number, headSha: pull.head.sha, baseRef: pull.base.ref };
   const rules = pull.state === "open" ? await readRules(token, { fullName: repo.full_name, ...commit }) : null;
-  const changed = rules ? findProtectedChanges(rules.base, rules.mergeBase, rules.head) : [];
+  const changed = rules ? await findRuleChanges(token, repo.full_name, rules, pull.head.sha) : [];
   const changes = rules ? describeRuleChanges(rules.base, rules.head, changed) : [];
   const approval = changed.length
-    ? await findApprover(env, token, { fullName: repo.full_name, authorId: pull.user.id, ...commit }, { repo, org })
+    ? await findApprover(env, token, { fullName: repo.full_name, authorId: pull.user.id, headRef: pull.head.ref, ...commit }, { repo, org }, rules!.head)
     : null;
-  const mine = pull.user.id === user.github_id;
-  const own = mine ? await getSelfApproval(env.DB, commit) : null;
-  const problem = mine && changed.length ? await selfApprovalProblem(token, org, repo.full_name, user, role) : null;
-  const check = (await listAnalyses(env.DB, repo.id, 100)).find((a) => a.kind === "pr_check" && a.commit_sha === pull.head.sha && a.pr_number === pull.number);
-  const outcome = check ? (JSON.parse(check.summary_json) as PrCheckOutcome) : null;
+  // Voxium wrote the pull request of a proposal, so only an approval given here counts for it.
+  const proposal = await getProposalByPr(env.DB, repo.id, pull.number);
+  const mine = !proposal && pull.user.id === user.github_id;
+  const given = proposal ? await getSelfApproval(env.DB, commit, "proposal") : null;
+  const own = proposal ? (given?.user_id === user.id ? given : null) : mine ? await getSelfApproval(env.DB, commit) : null;
+  const problem = !changed.length || !rules
+    ? null
+    : proposal
+      ? await proposalApprovalProblem(token, org, repo, user, role, proposal, { authorId: pull.user.id, baseRef: pull.base.ref }, rules.head)
+      : mine
+        ? await selfApprovalProblem(token, org, repo.full_name, user, role)
+        : null;
+  // Directly, however many checks of other pull requests came after it.
+  const check = await getPrCheck(env.DB, repo.id, pull.number, pull.head.sha);
+  const outcome = check ? (JSON.parse(check.summary_json) as StoredOutcome) : null;
 
   return (
     <>
-      <p className="muted">
-        <a href="/dashboard">Dashboard</a> / <a href={`/repos/${repo.id}`}>{repo.full_name}</a> / #{pull.number}
-      </p>
-      <h1>{pull.title}</h1>
-      <p className="muted">
-        <a href={pull.html_url}>Open on GitHub</a> · by {pull.user.login} · into {pull.base.ref} · commit <code>{pull.head.sha.slice(0, 7)}</code>
-        {pull.state === "closed" && ` · ${pull.merged ? "merged" : "closed"}`}
-      </p>
-      {error && <div className="card error">{error}</div>}
+      <PageHeader
+        crumbs={[["Dashboard", "/dashboard"], [repo.full_name, `/repos/${repo.id}`], [`#${pull.number}`]]}
+        title={pull.title}
+        meta={
+          <>
+            <span className={`badge ${pull.state === "open" ? "info" : pull.merged ? "ok" : ""}`}>{pull.state === "open" ? "open" : pull.merged ? "merged" : "closed"}</span>
+            <span>by {pull.user.login}</span>
+            <span>into <code>{pull.base.ref}</code></span>
+            <span>commit <code>{pull.head.sha.slice(0, 7)}</code></span>
+          </>
+        }
+        actions={<a className="btn secondary" href={pull.html_url}>Open on GitHub</a>}
+      />
+      <ErrorNotice error={error} />
+      {proposal && (
+        <Notice tone="info">
+          Voxium wrote this pull request for <a href={`/repos/${repo.id}/proposals/${proposal.id}`}>proposal #{proposal.id}</a>, asked for by{" "}
+          {proposal.requester_login}.
+        </Notice>
+      )}
+
+      <h2>Check</h2>
+      {!outcome && <p className="muted">Voxium has not checked this commit yet.</p>}
 
       {outcome && (
         <div className="card">
-          <span className={`badge ${outcome.state === "success" ? "ok" : "bad"}`}>{outcome.state}</span> {outcome.description}
+          <StateBadge state={outcome.state} /> {outcome.description}
           {outcome.newViolations.map((v, i) => (
-            <div key={i} style={{ marginTop: 6 }}>
-              <code>{v.ruleId}</code> {v.file}
+            <div className="violation" key={i}>
+              <code>{v.ruleId}</code> {v.file}{v.line ? `:${v.line}` : ""}
               <div className="muted">{v.message}</div>
             </div>
           ))}
+        </div>
+      )}
+
+      {outcome && (outcome.warnings ?? []).length > 0 && (
+        <div className="card">
+          <h3>Warnings, not blocking</h3>
+          {outcome.warnings!.map((v, i) => (
+            <div className="violation" key={i}>
+              <code>{v.ruleId}</code> {v.file}{v.line ? `:${v.line}` : ""}
+              <div className="muted">{v.message}</div>
+            </div>
+          ))}
+          {(outcome.warningCount ?? 0) > outcome.warnings!.length && <p className="muted">And {outcome.warningCount! - outcome.warnings!.length} more.</p>}
+        </div>
+      )}
+
+      {outcome?.warningsUnknown && (
+        <div className="card">
+          <h3>Warnings, not blocking</h3>
+          <p className="muted">They could not be worked out, because the code where this pull request branched off could not be read.</p>
         </div>
       )}
 
@@ -69,7 +116,7 @@ export default async function PullPage({ params, searchParams }: Props) {
           {rules && changed.length === 0 && <p className="muted">This pull request does not change the rules, so it needs no approval.</p>}
           {changed.length > 0 && (
             <div className="card">
-              <ul>
+              <ul className="changes">
                 {changes.map((c, i) => (
                   <li key={i}>{c}</li>
                 ))}
@@ -89,7 +136,7 @@ export default async function PullPage({ params, searchParams }: Props) {
             <div className="card">
               <span className="badge ok">Approved</span> by {approval.login}
               {approval.kind === "self_approved" && ", for their own pull request"}
-              {approval.reason && <p style={{ whiteSpace: "pre-wrap" }}>{approval.reason}</p>}
+              {approval.reason && <p className="prewrap">{approval.reason}</p>}
               {own && (
                 <form method="post" action={`/api/repos/${repo.id}/pulls/${pull.number}/approval`}>
                   <input type="hidden" name="action" value="withdraw" />
@@ -97,10 +144,29 @@ export default async function PullPage({ params, searchParams }: Props) {
                 </form>
               )}
             </div>
+          ) : proposal ? (
+            problem ? (
+              <Notice tone="warn">GitHub reviews do not count for this pull request, because Voxium wrote it. {problem}</Notice>
+            ) : (
+              <form className="card" method="post" action={`/api/repos/${repo.id}/pulls/${pull.number}/approval`}>
+                <p>
+                  GitHub reviews do not count for this pull request, because Voxium wrote it. Approve it here, with a reason that is kept in the
+                  decision log. It covers only commit <code>{pull.head.sha.slice(0, 7)}</code>, so a new push needs a new approval.
+                </p>
+                <input type="hidden" name="action" value="approve" />
+                <input type="hidden" name="sha" value={pull.head.sha} />
+                <input type="hidden" name="base" value={pull.base.ref} />
+                <label>
+                  Why should the rules change?
+                  <textarea name="reason" required minLength={10} maxLength={MAX_REASON} rows={4} />
+                </label>
+                <button type="submit">Approve this change</button>
+              </form>
+            )
           ) : !mine ? (
-            <p>An Owner or Team Leader with write access has to approve this commit in a GitHub review.</p>
+            <Notice tone="info">An Owner or Team Leader with write access has to approve this commit in a GitHub review.</Notice>
           ) : problem ? (
-            <p>{problem}</p>
+            <Notice tone="warn">{problem}</Notice>
           ) : (
             <form className="card" method="post" action={`/api/repos/${repo.id}/pulls/${pull.number}/approval`}>
               <p>

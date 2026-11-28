@@ -32,6 +32,7 @@ vi.mock("./store", () => ({
   },
   isLatestCheck: async (_db: unknown, id: number, sha: string, context: string, run: number) => runs.get(`${id} ${sha} ${context}`) === run,
   getSelfApproval: async (_db: unknown, pull: object) => (own && JSON.stringify(own.for) === JSON.stringify(pull) ? own : null),
+  getProposalByPr: async () => null,
   saveDecision: async (_db: unknown, d: object) => void decisions.push(d),
   setRepoSetup: async (_db: unknown, id: number, status: string, url: string | null) => void setups.push([id, status, url]),
   saveAnalysis: async (_db: unknown, a: unknown) => {
@@ -75,8 +76,12 @@ interface World {
   /** Contents the archive holds instead of the committed ones, as .gitattributes can do. */
   altered?: Files;
   truncated?: boolean;
+  /** The pull request's diff, or the status GitHub answers with instead. */
+  diff?: Array<{ filename: string; status: string; patch?: string }> | number;
   /** Called when a tarball is requested, to hold a run back. */
-  onTarball?: () => Promise<void>;
+  onTarball?: (sha: string) => Promise<void>;
+  /** A commit whose files GitHub cannot list completely. */
+  truncatedAt?: string;
 }
 
 let statuses: Array<{ sha: string; context: string; state: string; description: string }>;
@@ -94,13 +99,14 @@ function github(w: World) {
       return text === undefined ? json({}, 404) : new Response(text);
     }
     if ((m = p.match(/\/git\/trees\/(\w+)/))) {
-      return json({ truncated: w.truncated ?? false, tree: Object.entries(w.commits[m[1]]).map(([path, c]) => ({ path, type: "blob", sha: blobSha(c) })) });
+      return json({ truncated: (w.truncated ?? false) || w.truncatedAt === m[1], tree: Object.entries(w.commits[m[1]]).map(([path, c]) => ({ path, type: "blob", sha: blobSha(c) })) });
     }
     if ((m = p.match(/\/tarball\/(\w+)/))) {
-      await w.onTarball?.();
+      await w.onTarball?.(m[1]);
       const files = Object.entries(w.commits[m[1]]).filter(([f]) => !w.exportIgnore?.includes(f));
       return new Response(gzipSync(Buffer.concat([...files.map(([f, c]) => tarEntry(f, w.altered?.[f] ?? c)), Buffer.alloc(1024)])));
     }
+    if (p.includes("/pulls/4/files")) return typeof w.diff === "number" ? json({}, w.diff) : json(w.diff ?? []);
     if (p.includes("/reviews")) return json(w.reviews ?? []);
     if ((m = p.match(/\/collaborators\/(\w+)\/permission/))) {
       return json({ permission: w.writers?.includes(m[1]) ? "write" : "read", user: { id: 200 } });
@@ -160,6 +166,249 @@ describe("pull request check", () => {
     github({ branches: { main: "m" }, commits: { m: { ...code, ...rules }, head: { ...bad, ...rules } }, mergeBase: "m" });
     await runPullRequestCheck(ev);
     expect(last()).toMatchObject({ context: "voxium/rules", state: "failure" });
+  });
+
+  describe("a new cycle", () => {
+    // These rules know no layers, so only the diff tells which import of a cycle is new.
+    const arch = JSON.stringify({ ...JSON.parse(rules[ARCH]), layers: [], rules: JSON.parse(rules[ARCH]).rules.filter((r: any) => r.type === "no_cycles") });
+    const flat: Files = { ...rules, [ARCH]: arch };
+    const at = async (files: Files, diff: World["diff"]) => {
+      github({ branches: { main: "m" }, commits: { m: { ...code, ...flat }, head: { ...files, ...flat } }, mergeBase: "m", diff });
+      await runPullRequestCheck(ev);
+      expect(last()).toMatchObject({ state: "failure" });
+      const { summary } = saved.at(-1) as any;
+      expect(summary).not.toHaveProperty("cycles");
+      const [{ file, line, message }] = summary.newViolations;
+      return { file, line, message };
+    };
+    const head: Files = { ...code, "src/data/d.ts": `\nimport "../services/s";` };
+    const added = (filename: string, line: number) => ({ filename, status: "modified", patch: `@@ -0,0 +${line} @@\n+x` });
+
+    it("is shown at the import the pull request adds", async () => {
+      expect(await at(head, [added("src/data/d.ts", 2)])).toMatchObject({ file: "src/data/d.ts", line: 2 });
+      expect(await at(head, [added("src/services/s.ts", 1)])).toMatchObject({ file: "src/services/s.ts", line: 1 });
+    });
+
+    it("is not blamed on another line of a changed file", async () => {
+      expect(await at(head, [added("src/services/s.ts", 5)])).toMatchObject({ file: "src/data/d.ts" });
+    });
+
+    it("is the only reason to ask for the diff", async () => {
+      let asked = 0;
+      const diff = () => (asked++, []);
+      const w = (files: Files, baseline: string[]): World => {
+        const r = { ...flat, "voxium/baseline.json": JSON.stringify({ violations: baseline }) };
+        return { branches: { main: "m" }, commits: { m: { ...code, ...r }, head: { ...files, ...r } }, mergeBase: "m", get diff() { return diff(); } };
+      };
+      github(w(head, ["CYCLE01:data+services"]));
+      await runPullRequestCheck(ev);
+      expect([last()!.state, asked]).toEqual(["success", 0]);
+      github(w(head, []));
+      await runPullRequestCheck(ev);
+      expect(last()!.state).toBe("failure");
+      expect(asked).toBeGreaterThan(0);
+    });
+
+    it("is shown somewhere in the cycle when the diff does not tell", async () => {
+      for (const diff of [[], [added("src/data/d.ts", 1)], 503]) {
+        expect((await at(head, diff)).message).toMatch(/src\/data\/d\.ts:2 .*src\/services\/s\.ts|src\/services\/s\.ts:1 .*src\/data\/d\.ts/);
+      }
+    });
+
+    it("is shown at an import of a moved file, of one too large for a diff, or through a changed file", async () => {
+      for (const status of ["renamed", "modified"]) {
+        expect(await at(head, [{ filename: "src/services/s.ts", status }])).toMatchObject({ file: "src/services/s.ts" });
+        expect(await at(head, [{ filename: "src/data/d.ts", status }])).toMatchObject({ file: "src/data/d.ts" });
+      }
+      const through: Files = { ...code, "src/data/d.ts": `import "../x";`, "src/x.ts": `import "./services/s";` };
+      expect(await at(through, [added("src/x.ts", 1)])).toMatchObject({ file: "src/data/d.ts" });
+      const other: Files = { ...code, "src/services/s.ts": `import "../x";`, "src/x.ts": `import "./data/d";`, "src/data/d.ts": `import "../services/s";` };
+      expect(await at(other, [added("src/x.ts", 1)])).toMatchObject({ file: "src/services/s.ts" });
+    });
+  });
+
+  describe("what is left of an accepted cycle", () => {
+    const whole: Files = { "src/ui/Page.ts": `import "../services/s";`, "src/services/s.ts": `import "../ui/Page"; import "../data/d";`, "src/data/d.ts": `import "../services/s";` };
+    const own = prepareSetup(whole).setupFiles;
+    const arch = JSON.stringify({ ...JSON.parse(own[ARCH]), rules: JSON.parse(own[ARCH]).rules.filter((r: any) => r.type === "no_cycles") });
+    const r: Files = { [ARCH]: arch, "voxium/baseline.json": JSON.stringify({ violations: ["CYCLE01:data+services+ui"] }) };
+    const less: Files = { ...whole, "src/data/d.ts": "" };
+    let tarballs: string[];
+    const run = async (main: Files, head: Files, over: Partial<World> = {}) => {
+      tarballs = [];
+      const w: World = { branches: { main: "m" }, commits: { m: { ...main, ...r }, base: { ...main, ...r }, head: { ...head, ...r } }, mergeBase: "base", onTarball: async (sha) => void tarballs.push(sha), ...over };
+      github(w);
+      await runPullRequestCheck(ev);
+      return last();
+    };
+
+    it("passes, as existing debt", async () => {
+      expect(await run(whole, less)).toMatchObject({ state: "success" });
+      expect(saved.at(-1)).toMatchObject({ new_violations: 0, baseline_violations: 1 });
+      expect((saved.at(-1) as any).summary).not.toHaveProperty("needsBase");
+      expect(tarballs).toEqual(["head", "base"]);
+    });
+
+    it("is compared with where the pull request branched off", async () => {
+      const w = { commits: { m: { ...whole, "src/services/s.ts": "", ...r }, base: { ...whole, ...r }, head: { ...less, ...r } } };
+      expect(await run(whole, less, w)).toMatchObject({ state: "success" });
+      const gone = { commits: { m: { ...whole, ...r }, base: { ...whole, "src/services/s.ts": "", ...r }, head: { ...less, ...r } } };
+      expect(await run(whole, less, gone)).toMatchObject({ state: "failure" });
+    });
+
+    it("fails with a new connection", async () => {
+      const ring: Files = { "src/ui/Page.ts": `import "../services/s";`, "src/services/s.ts": `import "../data/d";`, "src/data/d.ts": `import "../ui/Page";` };
+      expect(await run(ring, { ...ring, "src/services/s.ts": `import "../ui/Page";` })).toMatchObject({ state: "failure" });
+      // The code where the branch began is not taken from a file the pull request renamed or rewrote.
+      expect(await run(ring, { ...ring, "src/services/s.ts": "", "src/services/t.ts": `import "../ui/Page";`, "src/ui/Page.ts": `import "../services/t";` })).toMatchObject({ state: "failure" });
+    });
+
+    it("fails when the earlier code cannot be listed or read", async () => {
+      expect(await run(whole, less, { truncatedAt: "base" })).toMatchObject({ state: "failure" });
+      expect(await run(whole, less, { altered: { "src/services/s.ts": "// changed on export" }, onTarball: undefined })).not.toMatchObject({ state: "success" });
+      expect(await run(whole, less, { onTarball: async (sha) => { if (sha === "base") throw new Error("down"); } })).toMatchObject({ state: "error" });
+    });
+
+    it("is not compared with contents an archive made up", async () => {
+      const ring: Files = { "src/ui/Page.ts": `import "../services/s";`, "src/services/s.ts": `import "../data/d";`, "src/data/d.ts": `import "../ui/Page";` };
+      const head = { ...ring, "src/services/s.ts": `import "../ui/Page";` };
+      const old = { ...ring, "src/services/old.ts": "// nothing" };
+      expect(await run(old, head, { altered: { "src/services/old.ts": `import "../ui/Page";` } })).toMatchObject({ state: "failure" });
+    });
+
+    it("needs no earlier code when the cycle is accepted as it is, or is new", async () => {
+      expect(await run(whole, whole)).toMatchObject({ state: "success" });
+      expect(tarballs).toEqual(["head"]);
+      expect(await run(whole, whole, { commits: { m: { ...whole, ...flatRules() }, head: { ...whole, ...flatRules() } }, mergeBase: "m" })).toMatchObject({ state: "failure" });
+      expect(tarballs).toEqual(["head"]);
+    });
+    const flatRules = (): Files => ({ ...r, "voxium/baseline.json": JSON.stringify({ violations: [] }) });
+  });
+
+  describe("warnings", () => {
+    const code: Files = { "src/ui/Page.ts": `import "../services/s";`, "src/services/s.ts": `import "../data/d";`, "src/data/d.ts": "" };
+    const own = prepareSetup(code).setupFiles;
+    const naming = { id: "NAME01", type: "naming", module: "*", files: "src/**", style: "kebab", description: "d", rationale: "r", severity: "warn" };
+    const r: Files = { [ARCH]: JSON.stringify({ ...JSON.parse(own[ARCH]), rules: [naming] }), "voxium/baseline.json": JSON.stringify({ violations: [] }) };
+    let tarballs: string[];
+    const run = async (head: Files, rules: Files = r, failAt?: string) => {
+      tarballs = [];
+      const onTarball = async (sha: string) => {
+        tarballs.push(sha);
+        if (sha === failAt) throw new Error("down");
+      };
+      github({ branches: { main: "m" }, commits: { m: { ...code, ...rules }, head: { ...head, ...rules } }, mergeBase: "m", onTarball });
+      await runPullRequestCheck(ev);
+      return (saved.at(-1) as any).summary;
+    };
+
+    it("are only those the pull request adds, judged against the code where it branched off", async () => {
+      const added = await run({ ...code, "src/ui/NewPage.ts": "" });
+      expect([added.warnings.map((v: any) => v.id), added.warningCount, added.state]).toEqual([["NAME01:src/ui/NewPage.ts"], 1, "success"]);
+      // Files the pull request does not change are taken from its own commit, so nothing more is downloaded here.
+      expect(tarballs).toEqual(["head"]);
+      // src/ui/Page.ts breaks the rule where the pull request branched off already, so it is not listed.
+      const edited = await run({ ...code, "src/data/d.ts": "export {};" });
+      expect([edited.warnings, edited.warningCount, edited.state]).toEqual([[], 0, "success"]);
+      expect(edited).not.toHaveProperty("needsBase");
+      expect(tarballs).toEqual(["head", "m"]);
+    });
+
+    it("never change the status when the code where the pull request branched off cannot be read", async () => {
+      const edited = { ...code, "src/data/d.ts": "export {};" };
+      const none: Files = { ...r, [ARCH]: JSON.stringify({ ...JSON.parse(own[ARCH]), rules: [] }) };
+      await run(edited, none, "m");
+      expect(last()).toMatchObject({ state: "success", description: "No new violations." });
+      // Only the head is downloaded without warnings.
+      expect(tarballs).toEqual(["head"]);
+      const summary = await run(edited, r, "m");
+      expect(last()).toMatchObject({ state: "success", description: "No new violations." });
+      expect(tarballs).toEqual(["head", "m"]);
+      expect([summary.state, summary.warnings, summary.warningCount, summary.warningsUnknown]).toEqual(["success", [], 0, true]);
+      expect(summary).not.toHaveProperty("pendingWarnings");
+      // The status is published before the warnings are worked out.
+      const order: string[] = [];
+      github({
+        branches: { main: "m" },
+        commits: { m: { ...code, ...r }, head: { ...edited, ...r } },
+        mergeBase: "m",
+        onTarball: async (sha) => void order.push(`tarball ${sha}:${statuses.filter((x) => x.state !== "pending").length}`),
+      });
+      const before = statuses.filter((x) => x.state !== "pending").length;
+      await runPullRequestCheck(ev);
+      expect(order).toEqual([`tarball head:${before}`, `tarball m:${before + 1}`]);
+    });
+
+    it("that depend on paths which are not source code are judged with the paths where the pull request branched off", async () => {
+      const opaque = { id: "OPQ", type: "no_opaque_imports", description: "d", rationale: "r", severity: "warn" };
+      const withOpaque: Files = { ...r, [ARCH]: JSON.stringify({ ...JSON.parse(own[ARCH]), rules: [opaque] }) };
+      const data: Files = {
+        "src/data/a.cjs": `require("./x.txt");`,
+        "src/data/b.cjs": `require("./node_modules/p");`,
+        "src/data/x.txt": "x",
+        "src/data/node_modules/p/package.json": "{}",
+      };
+      const base = { ...code, ...data };
+      github({ branches: { main: "m" }, commits: { m: { ...base, ...withOpaque }, head: { ...base, "src/data/d.ts": "export {};", ...withOpaque } }, mergeBase: "m" });
+      await runPullRequestCheck(ev);
+      const summary = (saved.at(-1) as any).summary;
+      expect([summary.state, summary.warnings, summary.warningCount]).toEqual(["success", [], 0]);
+      // The same import added by the pull request is new.
+      github({ branches: { main: "m" }, commits: { m: { ...base, ...withOpaque }, head: { ...base, "src/data/c.cjs": `require("./x.txt");`, ...withOpaque } }, mergeBase: "m" });
+      await runPullRequestCheck(ev);
+      expect((saved.at(-1) as any).summary.warnings.map((v: any) => v.id)).toEqual(["OPQ:src/data/c.cjs"]);
+    });
+  });
+
+  describe("config files where the pull request branched off", () => {
+    const layered = {
+      version: 1,
+      modules: { ui: { paths: ["apps/web/src/ui/**"] }, data: { paths: ["apps/web/src/data/**"] } },
+      layers: ["data", "ui"],
+      rules: [{ id: "LAYER01", type: "layers", description: "d", rationale: "r", severity: "block" }],
+      exceptions: [],
+    };
+    const r: Files = { [ARCH]: JSON.stringify(layered), "voxium/baseline.json": JSON.stringify({ violations: [] }) };
+    const base: Files = {
+      "package.json": JSON.stringify({ workspaces: ["apps/*"] }),
+      "apps/web/package.json": JSON.stringify({ name: "web" }),
+      "apps/web/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@web/*": ["src/*"] } } }),
+      "apps/web/src/data/db.ts": "",
+      "apps/web/src/ui/page.ts": "",
+      "apps/old/tsconfig.json": "{}",
+    };
+    const remapped: Files = {
+      ...base,
+      "apps/web/src/ui/page.ts": "import '@web/data/db';",
+      "apps/web/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@web/data/*": ["src/ui/stub/*"], "@web/*": ["src/*"] } } }),
+      "apps/web/src/ui/stub/db.ts": "",
+    };
+    let tarballs: string[];
+    const run = async (head: Files, over: Partial<World> = {}) => {
+      tarballs = [];
+      github({ branches: { main: "m" }, commits: { m: { ...base, ...r }, head: { ...head, ...r } }, mergeBase: "m", onTarball: async (sha) => void tarballs.push(sha), ...over });
+      await runPullRequestCheck(ev);
+      return last();
+    };
+
+    it("still count, so editing a tsconfig that is not the root one cannot drop an import", async () => {
+      expect(await run(remapped)).toMatchObject({ state: "failure", description: expect.stringContaining("LAYER01 x1") });
+      expect(tarballs).toEqual(["head", "m"]);
+    });
+
+    it("are only downloaded when the pull request changes one", async () => {
+      expect(await run({ ...base, "apps/web/src/ui/page.ts": "import '@web/data/db';" })).toMatchObject({ state: "failure" });
+      expect(tarballs).toEqual(["head"]);
+      expect(await run(base)).toMatchObject({ state: "success" });
+      expect(tarballs).toEqual(["head"]);
+    });
+
+    it("leave the check incomplete when they cannot be listed or read", async () => {
+      const { "apps/old/tsconfig.json": _, ...removed } = base;
+      expect(await run(removed)).toMatchObject({ state: "success" });
+      expect(await run(removed, { truncatedAt: "m" })).toMatchObject({ state: "error" });
+      expect(await run(removed, { altered: { "apps/old/tsconfig.json": "{ }" } })).toMatchObject({ state: "error" });
+    });
   });
 
   it("a PR against a weak branch cannot touch the voxium/rules status of the same commit", async () => {

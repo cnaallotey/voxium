@@ -1,3 +1,4 @@
+import type { ProtectedContents } from "@voxium/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -59,6 +60,9 @@ vi.mock("@/lib/github", () => ({
 vi.mock("@/lib/repo-job", () => ({
   readRules: async () => ({ base: { [ARCH]: strict }, mergeBase: { [ARCH]: strict }, head: { [ARCH]: state.head } }),
   findApprover: async () => state.approval,
+  // These pull requests have no agent files, so only the protected files can change.
+  findRuleChanges: async (_t: string, _r: string, rules: { base: ProtectedContents; mergeBase: ProtectedContents; head: ProtectedContents }) =>
+    (await import("@voxium/core")).findProtectedChanges(rules.base, rules.mergeBase, rules.head),
   runPullRequestCheck: async (ev: object) => void checks.push(ev),
 }));
 vi.mock("@/lib/store", () => ({
@@ -66,9 +70,11 @@ vi.mock("@/lib/store", () => ({
   getOrg: async () => ({ id: 9, installation_id: 3, account_login: "acme", account_type: state.type }),
   getRole: async () => state.role,
   listAnalyses: async () => [],
+  getPrCheck: async () => null,
   listPeople: async () => state.people,
   listDecisions: async () => state.decisions,
   getSelfApproval: async () => state.own,
+  getProposalByPr: async () => null,
   saveSelfApproval: async (_db: unknown, pull: object, userId: number, reason: string) => void saved.push({ ...pull, userId, reason }),
   withdrawSelfApproval: async (_db: unknown, ...a: unknown[]) => void withdrawn.push(a),
   setTeamLeader: async (_db: unknown, ...a: unknown[]) => { leaders.push(a); return true; },

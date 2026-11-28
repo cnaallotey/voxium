@@ -9,7 +9,7 @@ import {
   getRulesForPath,
   type ToolContext,
 } from "@voxium/core";
-import { loadArchitecture, loadBaseline, readProjectFiles, writeJson } from "@voxium/core/node";
+import { loadArchitecture, loadBaseline, readProjectFiles, saveProposal } from "@voxium/core/node";
 
 /** Read the project fresh on every call, so the agent always sees the current code and rules. */
 function context(root: string): ToolContext {
@@ -60,7 +60,7 @@ export function createServer(root: string): McpServer {
     "get_rules_for_path",
     {
       description:
-        "Before editing or creating a file, ask which module it belongs to and what it may and may not import. Returns allowed modules, forbidden modules, banned packages and applicable rules.",
+        "Before editing or creating a file, ask which module it belongs to and what it may and may not import. Returns allowed modules, forbidden modules, banned packages, the entry files of modules it may import, the file name style and the modules a file like it belongs in, and applicable rules.",
       inputSchema: { path: z.string().describe("Repo relative path of the file you are about to edit or create") },
     },
     async ({ path }) => guard(() => getRulesForPath(context(root), cleanPath(path))),
@@ -70,7 +70,7 @@ export function createServer(root: string): McpServer {
     "check_import",
     {
       description:
-        "Check one planned import before you write it. Target is a repo relative file path or a package name. Returns whether it is allowed, and if not, why and how to fix it.",
+        "Check one planned import before you write it. Target is a repo relative file path or a package name. Returns whether it is allowed, and if not, why and how to fix it, with the entry files to import instead when the target is internal to its module.",
       inputSchema: {
         from: z.string().describe("Repo relative path of the importing file"),
         target: z.string().describe("Repo relative path of the imported file, or a package name such as 'pg'"),
@@ -84,7 +84,7 @@ export function createServer(root: string): McpServer {
     "check_change",
     {
       description:
-        "Check planned file changes against the architecture before you finish. Pass the full new content of each changed file (content null means delete). Returns only the violations your change would introduce.",
+        "Check planned file changes against the architecture before you finish. Pass the full new content of each changed file (content null means delete). Returns only the violations your change would introduce, and files whose code cannot be read to its end, which have to be fixed first.",
       inputSchema: {
         changes: z
           .array(
@@ -104,19 +104,25 @@ export function createServer(root: string): McpServer {
     "propose_architecture_change",
     {
       description:
-        "Suggest a change to the architecture itself, for example a new module or a different layer order. You can suggest but cannot approve: the proposal is saved as pending and a Team Leader decides. Do not edit voxium/architecture.json yourself.",
+        "Suggest a change to the architecture itself, for example a new module, a different layer order or an exception. You can suggest but cannot approve: the proposal is saved in voxium/proposals as pending, and once it is committed in a pull request a Team Leader decides on the Voxium platform. Do not edit voxium/architecture.json yourself.",
       inputSchema: {
-        title: z.string().min(3),
+        title: z.string().min(3).max(200),
         summary: z.string().describe("What should change"),
         rationale: z.string().describe("Why the current architecture blocks the work"),
-        suggestedChange: z.string().optional().describe("Optional concrete suggestion"),
+        suggestedChange: z.string().optional().describe("Optional concrete suggestion in words"),
+        architecture: z.record(z.string(), z.unknown()).optional().describe("Optional: the whole architecture as it should be, in the format of voxium/architecture.json"),
+        exception: z
+          .object({ rule: z.string(), file: z.string(), owner: z.string(), reason: z.string(), expires: z.string().describe("YYYY-MM-DD") })
+          .optional()
+          .describe("Optional: one exception to add, instead of a whole architecture"),
+        acceptDebt: z.boolean().optional().describe("Accept as debt the violations the change would make new on the default branch"),
       },
     },
     async (input) =>
       guard(() => {
         const proposal = createProposal({ ...input, requestedBy: "agent" });
-        writeJson(root, `voxium/proposals/${proposal.id}.json`, proposal);
-        return { saved: `voxium/proposals/${proposal.id}.json`, ...proposal };
+        const saved = saveProposal(root, proposal);
+        return { saved: saved.path, ...proposal, id: saved.id };
       }),
   );
 

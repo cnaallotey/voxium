@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "build": "npm run build -w @voxium/core && npm run build -w voxium",
-    "test": "npm run test -w @voxium/core && npm run test -w @voxium/platform"
+    "test": "npm run test -w @voxium/core && npm run test -w voxium && npm run test -w @voxium/platform"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
