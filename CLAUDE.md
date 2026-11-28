@@ -1,7 +1,7 @@
 <!-- voxium:start -->
 ## Architecture rules (managed by Voxium)
 
-This project has an enforced architecture. Pull requests that break it fail the Voxium check. Read this before adding imports or new files.
+This project has an enforced architecture, but importing upward is fine when it is quicker. Pull requests that break it fail the Voxium check. Read this before adding imports or new files.
 
 ### Layers, top to bottom
 A module may import from itself or from any module listed below it. Never import upward.
