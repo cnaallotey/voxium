@@ -2,10 +2,12 @@
   "name": "voxium-monorepo",
   "private": true,
   "version": "0.0.1",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "build": "npm run build -w @voxium/core && npm run build -w voxium",
-    "test": "npm run test -w @voxium/core"
+    "test": "npm run test -w @voxium/core && npm run test -w voxium && npm run test -w @voxium/platform"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

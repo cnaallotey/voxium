@@ -1,7 +1,8 @@
 import { b64urlEncode, hmacSha256Hex, safeEqual } from "./crypto";
 
 export const SESSION_COOKIE = "voxium_session";
-const MAX_AGE_SECONDS = 60 * 60 * 24 * 14;
+// Access is refreshed from GitHub at sign in, so this is also how long a revoked repo can stay listed.
+const MAX_AGE_SECONDS = 60 * 60 * 8;
 
 export interface Session {
   uid: number;

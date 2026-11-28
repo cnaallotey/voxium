@@ -20,5 +20,8 @@
       "types": "./dist/node.d.ts",
       "default": "./dist/node.js"
     }
+  },
+  "dependencies": {
+    "@babel/parser": "7.29.14"
   }
 }

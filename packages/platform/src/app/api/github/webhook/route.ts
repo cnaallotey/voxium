@@ -1,21 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { verifyWebhookSignature } from "@/lib/crypto";
 import { getEnv, waitUntil } from "@/lib/env";
+import { recordDecision, recordReopened } from "@/lib/decisions";
 import { getInstallationToken, listInstallationRepos } from "@/lib/github";
-import { runPullRequestCheck } from "@/lib/repo-job";
+import { runPullRequestCheck, updateSetupStatus } from "@/lib/repo-job";
+import { runSnapshot } from "@/lib/snapshot-job";
+import { closedPrFrom, prEventFrom, type WebhookPayload } from "@/lib/webhook";
 import { deleteOrgByInstallation, getOrgByInstallation, removeRepos, upsertOrg, upsertRepos } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
-
-const PR_ACTIONS = new Set(["opened", "synchronize", "reopened", "ready_for_review"]);
-
-interface Payload {
-  action?: string;
-  installation?: { id: number; account?: { login: string; type: string } };
-  repositories_removed?: Array<{ id: number }>;
-  repository?: { full_name: string };
-  pull_request?: { number: number; head: { sha: string }; base: { sha: string } };
-}
 
 export async function POST(req: NextRequest) {
   const env = getEnv();
@@ -25,7 +18,7 @@ export async function POST(req: NextRequest) {
   }
 
   const event = req.headers.get("x-github-event");
-  const body = JSON.parse(raw) as Payload;
+  const body = JSON.parse(raw) as WebhookPayload;
   const installationId = body.installation?.id;
 
   if (event === "ping") return NextResponse.json({ ok: true });
@@ -36,6 +29,7 @@ export async function POST(req: NextRequest) {
     } else if (body.action === "created" && body.installation?.account) {
       const org = await upsertOrg(env.DB, {
         installation_id: installationId,
+        account_id: body.installation.account.id,
         account_login: body.installation.account.login,
         account_type: body.installation.account.type,
       });
@@ -53,16 +47,19 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true });
   }
 
-  if (event === "pull_request" && body.action && PR_ACTIONS.has(body.action) && installationId && body.repository && body.pull_request) {
-    waitUntil(
-      runPullRequestCheck({
-        installationId,
-        fullName: body.repository.full_name,
-        number: body.pull_request.number,
-        headSha: body.pull_request.head.sha,
-        baseSha: body.pull_request.base.sha,
-      }),
-    );
+  const prEvent = prEventFrom(event, body);
+  if (prEvent) {
+    if (event === "pull_request" && body.action === "reopened") waitUntil(recordReopened(prEvent));
+    waitUntil(runPullRequestCheck(prEvent));
+    return NextResponse.json({ ok: true, queued: true }, { status: 202 });
+  }
+
+  const closed = closedPrFrom(event, body);
+  if (closed) {
+    waitUntil(updateSetupStatus(closed));
+    waitUntil(recordDecision(closed));
+    // The default branch has new code: what it is like now goes into its history.
+    if (closed.merged) waitUntil(runSnapshot(closed));
     return NextResponse.json({ ok: true, queued: true }, { status: 202 });
   }
 

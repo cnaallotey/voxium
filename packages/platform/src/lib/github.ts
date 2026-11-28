@@ -64,7 +64,7 @@ export async function gh(token: string, path: string, init: RequestInit = {}): P
   });
 }
 
-async function ok<T>(res: Response, what: string): Promise<T> {
+export async function ok<T>(res: Response, what: string): Promise<T> {
   if (!res.ok) throw new Error(`GitHub ${what} failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
   return (await res.json()) as T;
 }
@@ -96,6 +96,45 @@ export async function listInstallationRepos(token: string): Promise<GhRepo[]> {
   return out;
 }
 
+export interface GhInstallation {
+  id: number;
+  app_id: number;
+  suspended_at: string | null;
+  account: { id: number; login: string; type: string };
+}
+
+/** Every installation the signed in user can reach. Throws rather than returning part of the list. */
+export async function listUserInstallations(userToken: string): Promise<GhInstallation[]> {
+  const out: GhInstallation[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const { installations } = await ok<{ installations: GhInstallation[] }>(
+      await gh(userToken, `/user/installations?per_page=100&page=${page}`),
+      "list installations",
+    );
+    out.push(...installations);
+    if (installations.length < 100) return out;
+  }
+  throw new Error("GitHub list installations failed: too many to read");
+}
+
+export interface GhUserRepo extends GhRepo {
+  permissions?: { admin?: boolean; maintain?: boolean; push?: boolean; pull?: boolean };
+}
+
+/** Repos of an installation that the signed in user can open. Stops at 3000, which only ever shows less. */
+export async function listUserRepos(userToken: string, installationId: number): Promise<GhUserRepo[]> {
+  const out: GhUserRepo[] = [];
+  for (let page = 1; page <= 30; page++) {
+    const { repositories } = await ok<{ repositories: GhUserRepo[] }>(
+      await gh(userToken, `/user/installations/${installationId}/repositories?per_page=100&page=${page}`),
+      "list user repositories",
+    );
+    out.push(...repositories);
+    if (repositories.length < 100) break;
+  }
+  return out;
+}
+
 /** Download a repo tarball at a ref. Returns the gzip stream, following GitHub's redirect. */
 export async function fetchTarball(token: string, fullName: string, ref: string): Promise<ReadableStream<Uint8Array>> {
   const res = await gh(token, `/repos/${fullName}/tarball/${encodeURIComponent(ref)}`, { redirect: "follow" });
@@ -112,10 +151,84 @@ export async function getFileAtRef(token: string, fullName: string, path: string
   return res.text();
 }
 
+/** Commit a branch points at. Uses the full branch ref, so a tag with the same name cannot stand in for it. */
+export async function getBranchSha(token: string, fullName: string, branch: string): Promise<string> {
+  const ref = branch.split("/").map(encodeURIComponent).join("/");
+  const data = await ok<{ object: { sha: string } }>(await gh(token, `/repos/${fullName}/git/ref/heads/${ref}`), "read branch");
+  return data.object.sha;
+}
+
+/** The commit where head branched off base. */
+export async function getMergeBase(token: string, fullName: string, baseSha: string, headSha: string): Promise<string> {
+  const data = await ok<{ merge_base_commit: { sha: string } }>(
+    await gh(token, `/repos/${fullName}/compare/${baseSha}...${headSha}?per_page=1`),
+    "compare",
+  );
+  return data.merge_base_commit.sha;
+}
+
+/**
+ * Every file in a commit with its git blob hash, or null when GitHub cannot list them all. The tarball alone
+ * is not proof of what a commit holds: .gitattributes can remove files from it or change their contents.
+ */
+export async function listTree(token: string, fullName: string, sha: string): Promise<Map<string, string> | null> {
+  const data = await ok<{ truncated: boolean; tree: Array<{ path: string; type: string; sha: string }> }>(
+    await gh(token, `/repos/${fullName}/git/trees/${sha}?recursive=1`),
+    "list files",
+  );
+  return data.truncated ? null : new Map(data.tree.filter((t) => t.type === "blob").map((t) => [t.path, t.sha]));
+}
+
+export interface GhReview {
+  user: { id: number; login: string; type: string } | null;
+  state: string;
+  commit_id: string | null;
+  body?: string | null;
+}
+
+/** All reviews, oldest first. Throws rather than returning part of a very long list. */
+export async function listReviews(token: string, fullName: string, number: number): Promise<GhReview[]> {
+  const out: GhReview[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const data = await ok<GhReview[]>(
+      await gh(token, `/repos/${fullName}/pulls/${number}/reviews?per_page=100&page=${page}`),
+      "list reviews",
+    );
+    out.push(...data);
+    if (data.length < 100) return out;
+  }
+  throw new Error("GitHub list reviews failed: too many reviews to read");
+}
+
+export interface GhPull {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  merged: boolean;
+  html_url: string;
+  user: { id: number; login: string };
+  head: { sha: string; ref?: string };
+  base: { ref: string; sha: string };
+}
+
+/** A pull request as it is now, or null when it does not exist. */
+export async function getPull(token: string, fullName: string, number: number): Promise<GhPull | null> {
+  const res = await gh(token, `/repos/${fullName}/pulls/${number}`);
+  if (res.status === 404) return null;
+  return ok<GhPull>(res, "read pull request");
+}
+
+/** True only when the organization has exactly this one member. */
+export async function isOnlyMember(token: string, org: string, githubId: number): Promise<boolean> {
+  const members = await ok<Array<{ id: number }>>(await gh(token, `/orgs/${encodeURIComponent(org)}/members?per_page=2`), "list members");
+  return members.length === 1 && members[0].id === githubId;
+}
+
 export async function setCommitStatus(
   token: string,
   fullName: string,
   sha: string,
+  context: string,
   state: "success" | "failure" | "pending" | "error",
   description: string,
   targetUrl?: string,
@@ -124,7 +237,7 @@ export async function setCommitStatus(
     method: "POST",
     body: JSON.stringify({
       state,
-      context: "voxium/rules",
+      context,
       description: description.slice(0, 140),
       ...(targetUrl ? { target_url: targetUrl } : {}),
     }),
@@ -137,21 +250,30 @@ export interface SetupPrResult {
   number: number;
   branch: string;
   reused: boolean;
+  /** The commit Voxium wrote, which the branch points at. */
+  commit: string;
 }
 
-/** Create (or update) a branch with the given files and open a pull request. Never pushes to the default branch. */
+/** The branch of a fresh pull request exists already, so someone else may have made it. */
+export class BranchExistsError extends Error {}
+
+/**
+ * Create (or update) a branch with the given files and open a pull request. Never pushes to the default branch.
+ * With fresh, a branch that exists already is an error, so a branch or pull request someone prepared is never reused.
+ */
 export async function createSetupPr(
   token: string,
   fullName: string,
   defaultBranch: string,
   files: Record<string, string>,
-  pr: { title: string; body: string; branch?: string },
+  pr: { title: string; body: string; branch?: string; fresh?: boolean; baseSha?: string },
 ): Promise<SetupPrResult> {
   const branch = pr.branch ?? "voxium/setup";
-  const base = await ok<{ object: { sha: string } }>(
-    await gh(token, `/repos/${fullName}/git/ref/heads/${encodeURIComponent(defaultBranch)}`),
-    "read default branch",
-  );
+  // Files planned on one commit go on top of that commit. On whatever the branch points at by now they could quietly
+  // undo what was merged in between.
+  const base = pr.baseSha
+    ? { object: { sha: pr.baseSha } }
+    : await ok<{ object: { sha: string } }>(await gh(token, `/repos/${fullName}/git/ref/heads/${encodeURIComponent(defaultBranch)}`), "read default branch");
   const baseCommit = await ok<{ tree: { sha: string } }>(
     await gh(token, `/repos/${fullName}/git/commits/${base.object.sha}`),
     "read base commit",
@@ -178,7 +300,9 @@ export async function createSetupPr(
     method: "POST",
     body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: commit.sha }),
   });
-  if (refRes.status === 422) {
+  if (refRes.status === 422 && pr.fresh) {
+    throw new BranchExistsError(`GitHub create branch failed: ${branch} exists`);
+  } else if (refRes.status === 422) {
     // Branch exists from an earlier attempt: move it to the new commit.
     await ok(
       await gh(token, `/repos/${fullName}/git/refs/heads/${branch}`, {
@@ -192,11 +316,24 @@ export async function createSetupPr(
   }
 
   const owner = fullName.split("/")[0];
-  const existing = await ok<Array<{ html_url: string; number: number }>>(
-    await gh(token, `/repos/${fullName}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`),
-    "find existing pull request",
-  );
-  if (existing.length) return { url: existing[0].html_url, number: existing[0].number, branch, reused: true };
+  // A branch that did not exist has no pull request yet.
+  const existing = pr.fresh
+    ? []
+    : await ok<Array<{ html_url: string; number: number }>>(
+        await gh(token, `/repos/${fullName}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`),
+        "find existing pull request",
+      );
+  if (existing.length) {
+    // Its files were just replaced, so what it says about them has to be as well.
+    await ok(
+      await gh(token, `/repos/${fullName}/pulls/${existing[0].number}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: pr.title, body: pr.body }),
+      }),
+      "update pull request",
+    );
+    return { url: existing[0].html_url, number: existing[0].number, branch, reused: true, commit: commit.sha };
+  }
 
   const created = await ok<{ html_url: string; number: number }>(
     await gh(token, `/repos/${fullName}/pulls`, {
@@ -205,5 +342,94 @@ export async function createSetupPr(
     }),
     "create pull request",
   );
-  return { url: created.html_url, number: created.number, branch, reused: false };
+  return { url: created.html_url, number: created.number, branch, reused: false, commit: commit.sha };
+}
+
+async function done(res: Response, what: string): Promise<void> {
+  if (!res.ok) throw new Error(`GitHub ${what} failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+}
+
+export async function createIssueComment(token: string, fullName: string, number: number, body: string): Promise<number> {
+  const res = await gh(token, `/repos/${fullName}/issues/${number}/comments`, { method: "POST", body: JSON.stringify({ body }) });
+  return (await ok<{ id: number }>(res, "create comment")).id;
+}
+
+/** False when the comment no longer exists. */
+export async function updateIssueComment(token: string, fullName: string, id: number, body: string): Promise<boolean> {
+  const res = await gh(token, `/repos/${fullName}/issues/comments/${id}`, { method: "PATCH", body: JSON.stringify({ body }) });
+  if (res.status === 404) return false;
+  await done(res, "update comment");
+  return true;
+}
+
+export async function deleteIssueComment(token: string, fullName: string, id: number): Promise<void> {
+  const res = await gh(token, `/repos/${fullName}/issues/comments/${id}`, { method: "DELETE" });
+  if (res.status !== 404) await done(res, "delete comment");
+}
+
+export interface GhPullFile {
+  filename: string;
+  /** "added", "modified", "renamed" and others. */
+  status: string;
+  /** Missing for binary and very large changes. */
+  patch?: string;
+}
+
+export async function listPullFiles(token: string, fullName: string, number: number): Promise<GhPullFile[]> {
+  const out: GhPullFile[] = [];
+  for (let page = 1; page <= 30; page++) {
+    const files = await ok<GhPullFile[]>(await gh(token, `/repos/${fullName}/pulls/${number}/files?per_page=100&page=${page}`), "list changed files");
+    out.push(...files);
+    if (files.length < 100) break;
+  }
+  return out;
+}
+
+export interface GhCommitPerson {
+  id: number;
+  login: string;
+}
+
+/**
+ * The GitHub accounts that wrote or committed each commit of a pull request. Null when it has more commits than one page
+ * shows, or when a commit names someone GitHub cannot match to an account, so that nobody can be left out unseen.
+ */
+export async function listPullCommitPeople(token: string, fullName: string, number: number): Promise<GhCommitPerson[] | null> {
+  type Person = { id: number; login: string } | null;
+  const commits = await ok<Array<{ author: Person; committer: Person }>>(
+    await gh(token, `/repos/${fullName}/pulls/${number}/commits?per_page=100`),
+    "list commits",
+  );
+  if (commits.length >= 100) return null;
+  const people = new Map<number, GhCommitPerson>();
+  for (const c of commits) {
+    for (const p of [c.author, c.committer]) {
+      if (!p || typeof p.id !== "number") return null;
+      people.set(p.id, { id: p.id, login: p.login });
+    }
+  }
+  return [...people.values()];
+}
+
+/** Several inline comments at once, so people get one notification. It is a comment, never an approval or a block. */
+export async function createReview(
+  token: string,
+  fullName: string,
+  number: number,
+  review: { commit_id: string; body: string; comments: Array<{ path: string; line: number; side: "RIGHT"; body: string }> },
+): Promise<number> {
+  const res = await gh(token, `/repos/${fullName}/pulls/${number}/reviews`, { method: "POST", body: JSON.stringify({ ...review, event: "COMMENT" }) });
+  return (await ok<{ id: number }>(res, "create review")).id;
+}
+
+export async function listReviewComments(token: string, fullName: string, number: number, reviewId: number): Promise<Array<{ id: number; body: string }>> {
+  return ok(await gh(token, `/repos/${fullName}/pulls/${number}/reviews/${reviewId}/comments?per_page=100`), "list review comments");
+}
+
+/** False when the comment no longer exists. */
+export async function updateReviewComment(token: string, fullName: string, id: number, body: string): Promise<boolean> {
+  const res = await gh(token, `/repos/${fullName}/pulls/comments/${id}`, { method: "PATCH", body: JSON.stringify({ body }) });
+  if (res.status === 404) return false;
+  await done(res, "update review comment");
+  return true;
 }
