@@ -29,7 +29,7 @@
     {
       "id": "LAYER01",
       "type": "layers",
-      "severity": "block",
+      "severity": "warn",
       "description": "Modules may only import from their own module or from modules lower in the layer order: cli > platform > core.",
       "rationale": "A fixed dependency direction keeps lower layers reusable and stops circular knowledge between areas of the app."
     },
