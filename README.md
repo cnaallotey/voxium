@@ -50,3 +50,5 @@ How it works: the repo holds the rules (`voxium/architecture.json`). The platfor
 * Agents can suggest architecture changes through MCP (saved as pending proposals), but nothing approves them yet. The approval flow belongs to the platform.
 * Not built yet: org level approval flow for architecture changes, remote MCP server on Workers, billing, generated test files, Queues for large repos.
 * The platform has been verified with unit tests and in the local Workers runtime with a local D1. It has not been run against a real GitHub App yet.
+
+<!-- e2e test: harmless change -->
