@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "modules": {
+    "cli": {
+      "paths": [
+        "packages/cli/**"
+      ],
+      "description": "Files under packages/cli/"
+    },
+    "core": {
+      "paths": [
+        "packages/core/**"
+      ],
+      "description": "Files under packages/core/"
+    },
+    "platform": {
+      "paths": [
+        "packages/platform/**"
+      ],
+      "description": "Files under packages/platform/"
+    }
+  },
+  "layers": [
+    "cli",
+    "platform",
+    "core"
+  ],
+  "rules": [
+    {
+      "id": "LAYER01",
+      "type": "layers",
+      "severity": "block",
+      "description": "Modules may only import from their own module or from modules lower in the layer order: cli > platform > core.",
+      "rationale": "A fixed dependency direction keeps lower layers reusable and stops circular knowledge between areas of the app."
+    },
+    {
+      "id": "CYCLE01",
+      "type": "no_cycles",
+      "severity": "block",
+      "description": "Modules must not depend on each other in a cycle.",
+      "rationale": "Cycles make modules impossible to change, test or extract on their own."
+    },
+    {
+      "id": "OPAQUE01",
+      "type": "no_opaque_imports",
+      "severity": "warn",
+      "description": "Code must not load modules in a way that hides which ones, such as import() of a variable.",
+      "rationale": "What cannot be told from the code cannot be checked, so such an import can break any other rule unnoticed."
+    },
+    {
+      "id": "SIZE01",
+      "type": "max_file_lines",
+      "max": 600,
+      "severity": "warn",
+      "description": "Source files should stay under 600 lines.",
+      "rationale": "Very large files usually mix responsibilities and are hard for humans and agents to change safely."
+    }
+  ],
+  "exceptions": [],
+  "aliases": {
+    "@voxium/core": [
+      "packages/core/src/index.ts"
+    ],
+    "@voxium/core/*": [
+      "packages/core/src/*",
+      "packages/core/*"
+    ],
+    "@voxium/platform": [
+      "packages/platform/package.json"
+    ],
+    "@voxium/platform/*": [
+      "packages/platform/src/*",
+      "packages/platform/*"
+    ],
+    "voxium": [
+      "packages/cli/package.json"
+    ],
+    "voxium/*": [
+      "packages/cli/src/*",
+      "packages/cli/*"
+    ]
+  }
+}
